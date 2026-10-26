@@ -1,0 +1,43 @@
+{
+  "name": "nimblebrain-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "nimblebrain-agent: an agent runtime that speaks the Agent Client Protocol",
+  "bin": {
+    "nimblebrain-agent": "./src/cli.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "bun test --no-env-file",
+    "lint": "biome lint src test",
+    "format": "biome format --write src test",
+    "sync": "bun scripts/sync.ts",
+    "sync:check": "bun scripts/sync.ts --check"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.0.2",
+    "@ai-sdk/anthropic": "4.0.57",
+    "@ai-sdk/openai": "4.0.70",
+    "@ai-sdk/provider": "4.0.17",
+    "@modelcontextprotocol/client": "2.3.0",
+    "@modelcontextprotocol/core": "2.3.0",
+    "@modelcontextprotocol/ext-apps": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.222.0",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-trace-base": "2.11.0",
+    "@opentelemetry/sdk-trace-node": "2.11.0",
+    "@opentelemetry/semantic-conventions": "1.43.0",
+    "@sinclair/typebox": "0.34.52",
+    "ai": "7.0.106",
+    "ajv": "8.20.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.3",
+    "@biomejs/biome": "2.5.14"
+  }
+}

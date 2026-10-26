@@ -1,0 +1,3 @@
+[install]
+minimumReleaseAge = 1209600
+minimumReleaseAgeExcludes = ["@types/bun", "@agentclientprotocol/sdk", "@modelcontextprotocol/client", "@modelcontextprotocol/core", "@modelcontextprotocol/server"]

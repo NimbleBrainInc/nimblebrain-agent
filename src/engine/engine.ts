@@ -1,0 +1,2628 @@
+import type {
+  JSONSchema7,
+  LanguageModelV4,
+  LanguageModelV4Content,
+  LanguageModelV4FunctionTool,
+  LanguageModelV4Message,
+  LanguageModelV4ToolCall,
+  LanguageModelV4ToolResultPart,
+  SharedV4ProviderOptions,
+} from "@ai-sdk/provider";
+import { DEFAULT_MAX_DIRECT_TOOLS, MAX_ITERATIONS } from "../limits.ts";
+import { applyCachePolicy } from "../model/cache-policy.ts";
+import {
+  GOOGLE_THINKING_LEVELS,
+  type GoogleThinkingLevel,
+  GREENPT_EFFORTS,
+  type GreenptEffort,
+  getProviderFromModel,
+  googleThinkingSupport,
+  greenptSupportedEfforts,
+  OPENAI_EFFORTS,
+  openaiSupportedEfforts,
+  supportsEnabledThinking,
+  XAI_EFFORTS,
+  type XAIEffort,
+  xaiSupportedEfforts,
+} from "../model/catalog.ts";
+import { normalizeForReplay } from "../model/inbound-fit.ts";
+import { callModel, type StreamResult } from "../model/stream.ts";
+import { log } from "../observability/log.ts";
+import { formatConnectorSkillBlock } from "../prompt/containment.ts";
+import { toolMatches } from "../skills/select.ts";
+import { MAX_SKILL_BODY_CHARS } from "../skills/truncate.ts";
+import type { TokenUsage } from "../usage/types.ts";
+import { addUsage, emptyUsage, tokenUsageFromV4 } from "../usage/types.ts";
+import { mapWithConcurrency } from "../util/concurrency.ts";
+import { splitInnerToolName } from "../util/tool-name.ts";
+import {
+  boundToolResultForModel,
+  extractResourceLinks,
+  extractTextForModel,
+  type ResourceLinkInfo,
+  textContent,
+} from "./content-helpers.ts";
+import { isContextOverflowError } from "./context-overflow.ts";
+import { withRetry } from "./retry.ts";
+import type {
+  ConnectorSkillInjectedPayload,
+  RunErrorPayload,
+  SkillNotDeliveredPayload,
+} from "./schemas/events.ts";
+import { createRunSupervisor, type RunSupervisor } from "./supervisor.ts";
+import { estimateMessageTokens, estimateToolDescriptionTokens } from "./token-estimate.ts";
+import {
+  buildToolDoneData,
+  coerceAndValidateToolInput,
+  enforceMaxToolResultSize,
+} from "./tool-call.ts";
+import { toolSchemaForLlm } from "./tool-schema-for-llm.ts";
+import {
+  CONNECTOR_SKILL_SYNTHETIC,
+  type ConnectorSkillCandidate,
+  type EngineConfig,
+  type EngineResult,
+  type EventSink,
+  type FinishReason,
+  isModelVisible,
+  type ResolvedThinking,
+  SKILL_ACTIVATED_META_KEY,
+  SKILL_ACTIVATED_SYNTHETIC,
+  SKILL_GUIDANCE_PENDING,
+  SKILL_SUPPRESSION_META_KEY,
+  type StopReason,
+  type ThinkingEffort,
+  type ToolCall,
+  type ToolCallRecord,
+  type ToolResult,
+  type ToolRouter,
+  type ToolSchema,
+} from "./types.ts";
+
+/** Default when the env knob is unset or unusable. */
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 6;
+
+/**
+ * Most calls one engine run dispatches to any ONE source at a time.
+ *
+ * "Per source" describes the grouping, not the enforcement, and the difference
+ * is the part the name gets wrong. The bound lives in one `AgentEngine`
+ * iteration, while an `McpSource` is long-lived and shared across every
+ * conversation in its workspace. Concurrent runs therefore each get their own
+ * budget; this is not a global rate limit on the source. Sizing guidance is in `docs/config/environment.mdx`.
+ *
+ * `NB_MAX_PARALLEL_TOOL_CALLS_PER_SOURCE` overrides the default.
+ */
+const MAX_PARALLEL_TOOL_CALLS_PER_SOURCE_PER_RUN = resolveMaxParallelToolCallsPerSource();
+
+/**
+ * Read the per-source-per-run cap from the environment.
+ *
+ * Exported for tests: the value above is resolved once at module load, so the
+ * fallback semantics are otherwise unobservable. A non-numeric, non-finite, or
+ * `< 1` value falls back to the default rather than disabling the bound —
+ * removing backpressure is never the right reading of a typo.
+ */
+export function resolveMaxParallelToolCallsPerSource(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): number {
+  const raw = Number(env.NB_MAX_PARALLEL_TOOL_CALLS_PER_SOURCE);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DEFAULT_MAX_PARALLEL_TOOL_CALLS;
+}
+
+/** Tokens reserved for visible content so thinking can't consume the whole reply. */
+const MIN_VISIBLE_OUTPUT_TOKENS = 4096;
+
+/** Anthropic's stated minimum thinking budget. Below this the API rejects. */
+const MIN_THINKING_BUDGET_TOKENS = 1024;
+
+/** Share of the available output budget each effort tier is allowed to think with. */
+const EFFORT_BUDGET_SHARE: Record<ThinkingEffort, number> = {
+  low: 0.15,
+  medium: 0.35,
+  high: 0.6,
+  xhigh: 0.8,
+  max: 1,
+};
+
+/**
+ * Hold a thinking budget below the output ceiling, leaving
+ * `MIN_VISIBLE_OUTPUT_TOKENS` for the answer itself.
+ *
+ * Applies to operator-set budgets as much as derived ones. Not because an
+ * oversized budget errors — the Anthropic adapter adds the thinking budget to
+ * `max_tokens` rather than fitting it inside, so it inflates the request
+ * instead of failing it. The point is that the operator's output ceiling stops
+ * meaning anything if thinking can raise it, and a budget that consumes the
+ * whole visible share produces the empty turn the Opus 4.7 incident was.
+ */
+function clampThinkingBudget(budget: number, maxOutputTokens: number): number {
+  return Math.max(
+    MIN_THINKING_BUDGET_TOKENS,
+    Math.min(budget, maxOutputTokens - MIN_VISIBLE_OUTPUT_TOKENS),
+  );
+}
+
+/**
+ * Size a token budget from a chosen depth, for providers that meter thinking
+ * in tokens (Anthropic up to 4.6, Gemini 2.5).
+ *
+ * This direction is sound where the reverse was not: the operator named a
+ * depth, and the model's own output ceiling is the natural scale to express it
+ * against. Deriving a *depth* from a ceiling nobody set was the defect — there
+ * was no intent in that number to recover.
+ */
+function effortToBudget(effort: ThinkingEffort, maxOutputTokens: number): number {
+  const available = maxOutputTokens - MIN_VISIBLE_OUTPUT_TOKENS;
+  return Math.max(MIN_THINKING_BUDGET_TOKENS, Math.floor(available * EFFORT_BUDGET_SHARE[effort]));
+}
+
+/**
+ * Clamp the platform ladder onto OpenAI's usable range.
+ *
+ * The adapter accepts `xhigh`, but its own documentation restricts that value
+ * to GPT-5.1-Codex-Max and says an unsupported model errors — and the adapter
+ * does no per-model gating, it just forwards the string. `high` is accepted by
+ * every OpenAI reasoning model, so both top tiers land there rather than
+ * turning a depth preference into a failed request.
+ */
+function toOpenAIEffort(effort: ThinkingEffort): "low" | "medium" | "high" {
+  // Shared with Nebius, which reaches its own adapter and its own options key
+  // but sends the same `reasoning_effort` values. Both ladders stop at `high`:
+  // Nebius rejects `xhigh` and `max` outright with a `literal_error` validation
+  // failure (measured), so clamping is what keeps a depth preference from
+  // becoming a failed request rather than a courtesy.
+  return effort === "xhigh" || effort === "max" ? "high" : effort;
+}
+
+/** Map the platform ladder onto Google's level names; Google's tops out at `high`. */
+function toGoogleLevel(effort: ThinkingEffort): GoogleThinkingLevel {
+  return effort === "xhigh" || effort === "max" ? "high" : effort;
+}
+
+/**
+ * GreenPT's ladder tops out at `high`, so the two tiers above it clamp: every
+ * measured model rejects `max`, including `kimi-k3`, whose launch post lists it.
+ */
+function toGreenptEffort(effort: ThinkingEffort): GreenptEffort {
+  return effort === "xhigh" || effort === "max" ? "high" : effort;
+}
+
+/** xAI's ladder tops out at `high`, so the two tiers above it clamp. */
+function toXaiEffort(effort: ThinkingEffort): XAIEffort {
+  return effort === "xhigh" || effort === "max" ? "high" : effort;
+}
+
+/**
+ * The deepest level at or below the one requested that this model accepts.
+ *
+ * Support is per-model, not per-generation, so an operator's tier may simply
+ * not exist here — `gemini-3.1-flash-lite-image` has no `medium`. Only steps down:
+ * stepping up would think harder than the operator asked for, which is a worse
+ * surprise than not honoring the tier, and no current row would ever reach it
+ * anyway (every level set contains `minimal` or `low`).
+ *
+ * `undefined` when the model offers nothing at or below the request — the
+ * caller then sends no level and the provider's own default stands.
+ */
+function nearestSupported<T extends string>(
+  wanted: T,
+  supported: ReadonlySet<string>,
+  ladder: readonly T[],
+): T | undefined {
+  for (let d = ladder.indexOf(wanted); d >= 0; d--) {
+    const l = ladder[d];
+    if (l && supported.has(l)) return l;
+  }
+  return undefined;
+}
+
+/** Process-wide deduplication for explicit tier mismatches. */
+const warnedTierDivergence = new Set<string>();
+
+/**
+ * Which tier to actually send, for any dialect carrying a per-model tier set.
+ * Google, OpenAI, xAI, and GreenPT tiers obey the same three-part rule:
+ *
+ *   - the model offers what was asked for → send it
+ *   - it doesn't, and the tier is the platform's own fallback rather than
+ *     something an operator wrote → send nothing, and let the model's default
+ *     stand. A tier nobody chose must not override the provider's own
+ *     judgement, and on Google stepping *down* can reason less than `off` does
+ *     on a model with no `minimal`.
+ *   - it doesn't, and an operator did choose it → step to the nearest tier at
+ *     or below. Never up: reasoning harder than asked is a worse surprise than
+ *     not honoring the tier.
+ *
+ * `undefined` means send no tier at all. A measured empty ladder (xAI models
+ * with no effort knob) is expected and stays silent; an unknown ladder is a
+ * coverage gap and warns when an operator's requested tier is dropped.
+ */
+function pickTier<T extends string>(
+  model: string,
+  wanted: T,
+  supported: ReadonlySet<string> | undefined,
+  ladder: readonly T[],
+  thinking: Extract<ResolvedThinking, { mode: "effort" | "enabled" }>,
+): T | undefined {
+  if (supported?.has(wanted)) return wanted;
+  if (thinking.source !== "operator" || supported?.size === 0) return undefined;
+
+  const tier = supported ? nearestSupported(wanted, supported, ladder) : undefined;
+  const key = JSON.stringify([model, thinking.effort]);
+  if (!warnedTierDivergence.has(key)) {
+    warnedTierDivergence.add(key);
+    const reason = supported ? `does not support "${wanted}"` : "has no measured effort ladder";
+    log.warn(
+      `[thinking] Requested thinkingEffort="${thinking.effort}" for "${model}", but it ${reason}; ` +
+        `sending ${tier ? `"${tier}"` : "no tier (provider default)"}. Logged once per model and requested tier.`,
+    );
+  }
+  return tier;
+}
+
+/**
+ * Build Anthropic's thinking options.
+ *
+ * Anthropic speaks two dialects and the split is per-model: 4.7, 4.8, and the
+ * 5-series reject `thinking.type=enabled` and take `thinking.type=adaptive`
+ * plus `output_config.effort`; everything earlier takes `thinking.type=enabled`
+ * with a token budget.
+ *
+ * `display: "summarized"` asks for the thinking text itself. The adaptive
+ * dialect omits it by default, so without this the response carries thinking
+ * blocks whose text is empty: the reasoning tokens are spent and billed, the
+ * turn stalls for as long as they take, and the client has nothing to show for
+ * the wait. It applies only to the adaptive dialect; the budget dialect returns
+ * thinking text unasked.
+ */
+function buildAnthropicThinkingOptions(
+  model: string,
+  thinking: ResolvedThinking,
+  maxOutputTokens: number,
+): SharedV4ProviderOptions {
+  const effortShaped = !supportsEnabledThinking(model);
+
+  switch (thinking.mode) {
+    case "off":
+      // Nothing to send. The adapter only serializes `thinking` when the type
+      // is `enabled` or `adaptive`, so `{type:"disabled"}` never reaches the
+      // wire for any model — emitting it just looked like enforcement.
+      // Anthropic's own default is not to think, which is what actually makes
+      // `off` work on the models where it works.
+      return {};
+    case "adaptive":
+      return { anthropic: { thinking: { type: "adaptive", display: "summarized" } } };
+    case "effort":
+    case "enabled": {
+      // Effort-shaped models take the tier either way: a token budget can't be
+      // metered there, but the depth chosen alongside it can.
+      if (effortShaped) {
+        return {
+          anthropic: {
+            thinking: { type: "adaptive", display: "summarized" },
+            effort: thinking.effort,
+          },
+        };
+      }
+      const budgetTokens =
+        thinking.mode === "enabled"
+          ? clampThinkingBudget(thinking.budgetTokens, maxOutputTokens)
+          : effortToBudget(thinking.effort, maxOutputTokens);
+      return { anthropic: { thinking: { type: "enabled", budgetTokens } } };
+    }
+  }
+}
+
+/**
+ * Build OpenAI's options. `@ai-sdk/openai` parses provider options under the
+ * literal name `"openai"` regardless of the `name` its instance was created
+ * with, so this key is fixed rather than derived.
+ *
+ * Nebius is NOT routed here even though it speaks the same wire protocol — it
+ * is built through `createOpenAICompatible`, which reads options under its
+ * instance name. See `buildNebiusThinkingOptions`.
+ */
+function buildOpenAIThinkingOptions(
+  model: string,
+  thinking: ResolvedThinking,
+): SharedV4ProviderOptions {
+  switch (thinking.mode) {
+    case "off":
+      // `reasoningEffort: "none"` exists but the adapter documents it as
+      // GPT-5.1-only and an error elsewhere. Omitting the option leaves the
+      // model at its own default, which is the closest honest thing — on
+      // o-series models reasoning cannot be turned off at all.
+      return {};
+    case "adaptive":
+      // No adaptive equivalent; the model applies its own per-call default.
+      return {};
+    case "effort":
+    case "enabled": {
+      // `gpt-5-pro` rejects `medium` — the platform fallback — so without
+      // this a stock install 400s on every call to it.
+      const tier = pickTier(
+        model,
+        toOpenAIEffort(thinking.effort),
+        openaiSupportedEfforts(model),
+        OPENAI_EFFORTS,
+        thinking,
+      );
+      return tier ? { openai: { reasoningEffort: tier } } : {};
+    }
+  }
+}
+
+/**
+ * Build GreenPT's options.
+ *
+ * Same wire parameter as OpenAI (`reasoning_effort`) under the `greenpt` key,
+ * which is what `createOpenAICompatible` reads for the instance the registry
+ * names `greenpt`; an `openai` key reaches the wire as nothing.
+ *
+ * Support is per-model and fail-closed, like xAI: the ladders differ across
+ * GreenPT's catalog and an unaccepted value 400s the call, so a model with no
+ * measured row gets nothing. `off` sends `none` where the model accepts it.
+ */
+function buildGreenptThinkingOptions(
+  model: string,
+  thinking: ResolvedThinking,
+): SharedV4ProviderOptions {
+  const supported = greenptSupportedEfforts(model);
+
+  switch (thinking.mode) {
+    case "off":
+      return supported?.has("none") ? { greenpt: { reasoningEffort: "none" } } : {};
+    case "adaptive":
+      // No adaptive equivalent; the model applies its own per-call default.
+      return {};
+    case "effort":
+    case "enabled": {
+      const tier = pickTier(
+        model,
+        toGreenptEffort(thinking.effort),
+        supported,
+        GREENPT_EFFORTS,
+        thinking,
+      );
+      return tier ? { greenpt: { reasoningEffort: tier } } : {};
+    }
+  }
+}
+
+/**
+ * Build Nebius's options.
+ *
+ * Same wire parameter as OpenAI (`reasoning_effort`) under a different options
+ * key: `createOpenAICompatible` reads `providerOptions.<name>`, and the registry
+ * names this instance `nebius`. Sending `openai` here reaches the wire as
+ * nothing at all — no error, every call at the model's own default.
+ *
+ * No per-model table, unlike OpenAI and xAI. Nebius accepts all three tiers on
+ * every catalog model (measured), and the catalog is curated + probe-verified by
+ * `sync-nebius`, so there is no unmeasured id to fail closed against. Its floor
+ * is `low`, so `off` has nothing to send.
+ */
+function buildNebiusThinkingOptions(thinking: ResolvedThinking): SharedV4ProviderOptions {
+  switch (thinking.mode) {
+    case "off":
+    case "adaptive":
+      // Nebius has no value meaning "don't reason" and no adaptive equivalent;
+      // either way the model applies its own default.
+      return {};
+    case "effort":
+    case "enabled":
+      return { nebius: { reasoningEffort: toOpenAIEffort(thinking.effort) } };
+  }
+}
+
+/**
+ * Build xAI's options.
+ *
+ * A separate function from the OpenAI one on purpose, for two independent
+ * reasons — do not merge them.
+ *
+ * 1. **The key differs.** `@ai-sdk/xai` reads `providerOptions.xai`, where
+ *    `@ai-sdk/openai` hardcodes `openai` regardless of the instance name. An
+ *    `openai` key here is silently dropped: no error, every call at the model's
+ *    own default. The rule is that a provider-options key follows its *adapter*,
+ *    not the wire protocol it speaks.
+ * 2. **`off` is honorable here.** `reasoning_effort: "none"` measurably
+ *    suppresses (`reasoning_tokens: 0`), so `off` sends something instead of
+ *    giving up — the first effort-dialect model where it can. The other
+ *    effort-shaped providers have no value meaning "don't" (OpenAI's floor is
+ *    `minimal`, Nebius's is `low`), so their `off` sends nothing. Google
+ *    suppresses too, but through the budget dialect's `thinkingBudget: 0`
+ *    (`googleBudgetOptions`) rather than a tier.
+ *
+ * Support is per-model and fail-closed: a model with no measured ladder, or a
+ * measured-empty one (reasons but exposes no knob), gets nothing rather than a
+ * guess. Sending a tier to those 400s the call outright.
+ */
+function buildXaiThinkingOptions(
+  model: string,
+  thinking: ResolvedThinking,
+): SharedV4ProviderOptions {
+  const supported = xaiSupportedEfforts(model);
+
+  switch (thinking.mode) {
+    case "off":
+      // Only where measured — `grok-4.5` rejects `none` while taking the rest,
+      // so this cannot be assumed from the provider.
+      return supported?.has("none") ? { xai: { reasoningEffort: "none" } } : {};
+    case "adaptive":
+      // No adaptive equivalent; the model applies its own per-call default.
+      return {};
+    case "effort":
+    case "enabled": {
+      const tier = pickTier(model, toXaiEffort(thinking.effort), supported, XAI_EFFORTS, thinking);
+      return tier ? { xai: { reasoningEffort: tier } } : {};
+    }
+  }
+}
+
+/** Google models already warned about, so an unmapped one is reported once per process. */
+const warnedUnmappedGoogle = new Set<string>();
+
+/** Gemini 3's dialect: a named level, from the set this specific model accepts. */
+function googleLevelOptions(
+  model: string,
+  thinking: ResolvedThinking,
+  levels: ReadonlySet<GoogleThinkingLevel>,
+): SharedV4ProviderOptions {
+  if (thinking.mode === "adaptive") return {};
+  if (thinking.mode === "off") {
+    // `minimal` is the only level meaning "barely think", and not every Gemini 3
+    // model offers it. Stepping up to `low` would answer "don't reason" with an
+    // instruction to reason, so say nothing — the same choice made for
+    // Anthropic, OpenAI, and the Gemini 2.5 models that can't disable thinking.
+    return levels.has("minimal")
+      ? { google: { thinkingConfig: { thinkingLevel: "minimal" } } }
+      : {};
+  }
+  const level = pickTier(
+    model,
+    toGoogleLevel(thinking.effort),
+    levels,
+    GOOGLE_THINKING_LEVELS,
+    thinking,
+  );
+  return level ? { google: { thinkingConfig: { thinkingLevel: level } } } : {};
+}
+
+/** Gemini 2.5's dialect: a token budget, inside the model's own documented range. */
+function googleBudgetOptions(
+  thinking: ResolvedThinking,
+  support: { min: number; max: number; canDisable: boolean },
+  maxOutputTokens: number,
+): SharedV4ProviderOptions {
+  switch (thinking.mode) {
+    case "off":
+      // 2.5 Pro cannot stop thinking; a zero budget there is rejected.
+      return support.canDisable ? { google: { thinkingConfig: { thinkingBudget: 0 } } } : {};
+    case "adaptive":
+      return { google: { thinkingConfig: { thinkingBudget: -1 } } };
+    case "effort":
+    case "enabled": {
+      const requested =
+        thinking.mode === "enabled"
+          ? thinking.budgetTokens
+          : effortToBudget(thinking.effort, maxOutputTokens);
+      // Two ceilings apply: the model's own thinking range, and the room left
+      // in this call's output budget for a visible answer.
+      const ceiling = Math.min(support.max, maxOutputTokens - MIN_VISIBLE_OUTPUT_TOKENS);
+      // Floor above the model's own minimum as well as Anthropic's, because on
+      // a model whose minimum is 0 that value is the *disable* sentinel: a
+      // tight output ceiling would otherwise turn "reason as hard as possible"
+      // into "do not reason", byte-identical to `off`. The Anthropic path
+      // floors the same way and degrades to thinking a little.
+      const floor = Math.max(support.min, MIN_THINKING_BUDGET_TOKENS);
+      return {
+        google: {
+          thinkingConfig: { thinkingBudget: Math.max(floor, Math.min(requested, ceiling)) },
+        },
+      };
+    }
+  }
+}
+
+/**
+ * Build Google Gemini options.
+ *
+ * Which dialect a model speaks — and which levels or budgets it accepts — is
+ * per-model and comes from `googleThinkingSupport`. A model with no verified
+ * entry gets nothing, which is what every Google model got before this wiring
+ * existed; sending a guessed dialect is how a stock install starts returning
+ * 400s.
+ */
+function buildGoogleThinkingOptions(
+  model: string,
+  thinking: ResolvedThinking,
+  maxOutputTokens: number,
+): SharedV4ProviderOptions {
+  const support = googleThinkingSupport(model);
+  if (!support) {
+    // Fail closed, but not silently. This is the likelier path than the
+    // resolver's own capability gate — most reasoning-capable Google models in
+    // the catalog have no row — and an operator who set a depth on one of them
+    // otherwise gets nothing at all, right after release notes saying Google
+    // is wired. Skip the platform's own fallback tier: nobody asked for it.
+    const operatorAsked =
+      thinking.mode === "off" || thinking.mode === "adaptive"
+        ? true
+        : thinking.source !== "platform";
+    if (operatorAsked && !warnedUnmappedGoogle.has(model)) {
+      warnedUnmappedGoogle.add(model);
+      log.warn(
+        `[thinking] No published thinking support for "${model}", so no reasoning options are ` +
+          "sent and it runs at Google's default. Add a row to GOOGLE_THINKING in " +
+          "src/model/catalog.ts once its supported levels or budget range are documented. " +
+          "Logged once per model.",
+      );
+    }
+    return {};
+  }
+  return support.dialect === "level"
+    ? googleLevelOptions(model, thinking, support.levels)
+    : googleBudgetOptions(thinking, support, maxOutputTokens);
+}
+
+/**
+ * Translate the platform's provider-neutral thinking config into the call's
+ * `providerOptions` shape.
+ *
+ * Every provider is reached through one table here, so the resolver upstream
+ * never has to know which dialect a model speaks — it decides whether to
+ * reason and how hard, and this decides how to say it.
+ */
+function buildThinkingProviderOptions(
+  model: string,
+  thinking: ResolvedThinking | undefined,
+  maxOutputTokens: number,
+): SharedV4ProviderOptions {
+  if (!thinking) return {};
+  switch (getProviderFromModel(model)) {
+    case "anthropic":
+      return buildAnthropicThinkingOptions(model, thinking, maxOutputTokens);
+    case "openai":
+      return buildOpenAIThinkingOptions(model, thinking);
+    case "greenpt":
+      return buildGreenptThinkingOptions(model, thinking);
+    case "nebius":
+      return buildNebiusThinkingOptions(thinking);
+    case "xai":
+      return buildXaiThinkingOptions(model, thinking);
+    case "google":
+      return buildGoogleThinkingOptions(model, thinking, maxOutputTokens);
+    default:
+      // Unknown provider: say nothing and let it apply its own default.
+      return {};
+  }
+}
+
+/**
+ * Map a per-call finish reason to a run-level stop reason. Called once
+ * the agent loop has exited (no pending tool calls). The iteration cap
+ * is checked first by the caller — this only handles model-driven exits.
+ */
+function deriveStopReason(finish: FinishReason | undefined): StopReason {
+  switch (finish) {
+    case "stop":
+      return "complete";
+    case "length":
+      return "length";
+    case "content-filter":
+      return "content_filter";
+    case "error":
+      return "error";
+    case "tool-calls":
+      // Loop only exits when toolCalls.length === 0; reaching here with
+      // finish="tool-calls" means the model declared tool calls but the
+      // stream produced no parsable ones. Surface as "other" rather than
+      // pretending it was a clean stop.
+      return "other";
+    default:
+      return "other";
+  }
+}
+
+/**
+ * The provider-native finish reason as an optional `finishReasonRaw` field.
+ * Several distinct provider stops share the unified "other", so the raw value
+ * is what names the cause. Empty when the provider reported none.
+ */
+function rawFinishReasonField(raw: string | undefined): { finishReasonRaw?: string } {
+  return raw ? { finishReasonRaw: raw } : {};
+}
+
+/**
+ * Sanitize messages before sending to the LLM API.
+ * Removes empty text content blocks that cause "text content blocks must be non-empty" errors.
+ * This can happen when conversation history contains assistant messages from tool-only turns.
+ */
+function sanitizeMessages(messages: LanguageModelV4Message[]): LanguageModelV4Message[] {
+  return messages.map((msg): LanguageModelV4Message => {
+    // System messages have string content — pass through unchanged
+    if (msg.role === "system") return msg;
+    if (!Array.isArray(msg.content)) return msg;
+
+    const filtered = msg.content.filter((part) => {
+      if ("type" in part && part.type === "text" && "text" in part) {
+        return typeof part.text === "string" && part.text.length > 0;
+      }
+      return true;
+    });
+
+    // If all content was filtered out, keep a minimal text block
+    if (filtered.length === 0) {
+      return {
+        ...msg,
+        content: [{ type: "text" as const, text: "(empty)" }],
+      } as LanguageModelV4Message;
+    }
+
+    return filtered.length === msg.content.length
+      ? msg
+      : ({ ...msg, content: filtered } as LanguageModelV4Message);
+  });
+}
+
+/**
+ * Seed the connector-skill dedup set from history metadata. Kept as a fallback
+ * for callers that pass metadata-bearing messages directly (the engine+store
+ * integration test): on the real chat path `rehydrateUserResources` strips
+ * message `metadata` (where the synthetic marker lives) before the engine sees
+ * the messages, so this scan can't be the sole source there. No-op when there
+ * are no candidates.
+ */
+function seedInjectedConnectorSkills(
+  history: LanguageModelV4Message[],
+  connectorSkillCandidates: ConnectorSkillCandidate[],
+  injectedConnectorSkills: Set<string>,
+): void {
+  if (connectorSkillCandidates.length === 0) return;
+  for (const m of history) {
+    const meta = (m as { metadata?: { synthetic?: string; skill?: string | null } }).metadata;
+    // Both delivery channels count: a surface-once overlay message and a
+    // `nb__use_skill` activation result each put the full body in history, so
+    // either marker means "already delivered — don't inject again".
+    const delivered =
+      meta?.synthetic === CONNECTOR_SKILL_SYNTHETIC ||
+      meta?.synthetic === SKILL_ACTIVATED_SYNTHETIC;
+    if (delivered && typeof meta?.skill === "string") {
+      injectedConnectorSkills.add(meta.skill);
+    }
+  }
+}
+
+/**
+ * Build the router-wide lookups the run needs. Uses ALL tools from the router
+ * (not just the direct/surfaced subset passed to the LLM) because tiered
+ * surfacing may proxy tools whose `_meta` mounts a UI:
+ *   - `toolMeta`: tool name → the tool's `_meta` (UI metadata like resourceUri).
+ *   - `allToolSchemaMap`: tool name → schema (used to resolve agent-promoted tools).
+ */
+function buildToolLookups(allRouterTools: ToolSchema[]): {
+  toolMeta: Map<string, Record<string, unknown>>;
+  allToolSchemaMap: Map<string, ToolSchema>;
+} {
+  const toolMeta = new Map<string, Record<string, unknown>>();
+  for (const t of allRouterTools) {
+    if (t.meta) toolMeta.set(t.name, t.meta);
+  }
+
+  const allToolSchemaMap = new Map<string, ToolSchema>();
+  for (const t of allRouterTools) {
+    allToolSchemaMap.set(t.name, t);
+  }
+
+  return { toolMeta, allToolSchemaMap };
+}
+
+/**
+ * Fold a fresh router listing into the run's lookups in place (the tool
+ * controls and per-call contexts hold these same Map objects). Adds and
+ * overwrites, never removes: a connector that is down at refresh time is
+ * absent from the listing, and dropping its `toolMeta` entries would read its
+ * app-only tools as model-visible (absent meta defaults to visible).
+ */
+function mergeToolLookups(
+  fresh: ToolSchema[],
+  toolMeta: Map<string, Record<string, unknown>>,
+  allToolSchemaMap: Map<string, ToolSchema>,
+): void {
+  for (const t of fresh) {
+    allToolSchemaMap.set(t.name, t);
+    if (t.meta) toolMeta.set(t.name, t.meta);
+    else toolMeta.delete(t.name);
+  }
+}
+
+/** Throw the abort reason if the run's signal is already aborted. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+  }
+}
+
+/** Estimated input tokens of one model call: every prompt message (system included) and tool definition. */
+function estimatePromptTokens(
+  prompt: LanguageModelV4Message[],
+  tools: LanguageModelV4FunctionTool[],
+): number {
+  return (
+    prompt.reduce((sum, m) => sum + estimateMessageTokens(m), 0) +
+    tools.reduce((sum, t) => sum + estimateToolDescriptionTokens(t), 0)
+  );
+}
+
+/** Apply the transformPrompt hook when present; otherwise the system prompt verbatim. */
+function resolveCallPrompt(config: EngineConfig, systemPrompt: string): string {
+  return config.hooks?.transformPrompt ? config.hooks.transformPrompt(systemPrompt) : systemPrompt;
+}
+
+/**
+ * On the run's final step, append the wrap-up system-reminder as a TAIL
+ * message, not by appending to the system prompt: mutating the system block
+ * would bust its (1-hour) cache breakpoint — and the whole message prefix after
+ * it — on the final call of every run. As a tail message the reminder rides the
+ * volatile (5-minute) region and leaves the stable prefix byte-identical, so the
+ * final call still reads it from cache. Merge into a trailing user turn when
+ * present to avoid consecutive user messages; otherwise append a fresh one.
+ * No-op when `isFinalStep` is false.
+ *
+ * The wording names no audience and no format: the same reminder ends a chat
+ * turn and a task run whose answer must match an output schema.
+ */
+function appendFinalStepReminder(
+  callMessages: LanguageModelV4Message[],
+  isFinalStep: boolean,
+): LanguageModelV4Message[] {
+  if (!isFinalStep) return callMessages;
+  const finalStep =
+    "<system-reminder>This is your final step. Do NOT call any more tools. " +
+    "Give your final answer now with what you have; if anything remains " +
+    "unfinished, say so within that answer.</system-reminder>";
+  const last = callMessages[callMessages.length - 1];
+  if (last && last.role === "user" && Array.isArray(last.content)) {
+    return [
+      ...callMessages.slice(0, -1),
+      { ...last, content: [...last.content, { type: "text", text: finalStep }] },
+    ];
+  }
+  return [...callMessages, { role: "user", content: [{ type: "text", text: finalStep }] }];
+}
+
+/**
+ * Whether the run-wide input cap (`EngineConfig.maxRunInputTokens`) would
+ * likely refuse the call after this one: this call and one more of the same
+ * size would pass it. The call about to be sent is then the run's last
+ * chance to answer, so it carries the final-step reminder. Without it the
+ * model learns of the cap only when `checkBeforeCall` stops the run, and a run
+ * that writes its answer last ends with no deliverable. Calls grow as tool
+ * results accumulate, so the margin is a projection, not a guarantee; the
+ * hard stop in `checkBeforeCall` stays the backstop.
+ */
+function nearRunInputCap(
+  config: EngineConfig,
+  call: { spentInput: number; lastCallInputTokens: number; estimate: () => number },
+): boolean {
+  if (config.maxRunInputTokens === undefined) return false;
+  const projected = Math.max(call.lastCallInputTokens, call.estimate());
+  return call.spentInput + 2 * projected > config.maxRunInputTokens;
+}
+
+/**
+ * The fewest output tokens a call is sent with when the run's spend accounts
+ * clamp it. A call allowed less could not write a useful step (a tool call
+ * with its arguments, or a short answer), so the run stops with `spend_limit`
+ * instead of sending it.
+ */
+const MIN_SPEND_CALL_OUTPUT_TOKENS = 256;
+
+/**
+ * The output tokens a call may write beyond its `maxOutputTokens`: the
+ * Anthropic adapter adds an `enabled` thinking budget on top of `max_tokens`
+ * (see `clampThinkingBudget`). Every other dialect fits thinking inside it.
+ */
+function thinkingBeyondMaxOutput(options: SharedV4ProviderOptions): number {
+  const thinking = (
+    options.anthropic as { thinking?: { type?: string; budgetTokens?: number } } | undefined
+  )?.thinking;
+  return thinking?.type === "enabled" ? (thinking.budgetTokens ?? 0) : 0;
+}
+
+/**
+ * Whether the next model call may be sent, and with how many output tokens,
+ * judged before it is: the run-wide input cap (`EngineConfig.maxRunInputTokens`)
+ * first, then the spend accounts (`EngineConfig.spend`). The call's input is
+ * projected as the larger of the estimate of the prompt about to be sent and
+ * the previous call's reported input.
+ *
+ * The accounts are asked for the call's whole output ceiling, thinking budget
+ * included, and answer with the largest they can pay for (reserved until the
+ * call is debited). The call's `maxOutputTokens` is clamped so that it plus
+ * its thinking budget fits that answer: the thinking budget never grows with a
+ * smaller ceiling, so `granted − budget(min(ceiling, granted))` fits, and the
+ * minimum asked for (`MIN_SPEND_CALL_OUTPUT_TOKENS` plus its own budget) keeps
+ * that at or above `MIN_SPEND_CALL_OUTPUT_TOKENS`.
+ */
+function checkBeforeCall(
+  config: EngineConfig,
+  call: { spentInput: number; lastCallInputTokens: number; estimate: () => number },
+): "max_input_tokens" | { spendAccountId: string } | { maxOutputTokens: number } {
+  const ceiling = config.maxOutputTokens;
+  if (config.maxRunInputTokens === undefined && !config.spend) return { maxOutputTokens: ceiling };
+  const projected = Math.max(call.lastCallInputTokens, call.estimate());
+  if (
+    config.maxRunInputTokens !== undefined &&
+    call.spentInput + projected > config.maxRunInputTokens
+  ) {
+    return "max_input_tokens";
+  }
+  if (!config.spend) return { maxOutputTokens: ceiling };
+  const beyond = (max: number) =>
+    thinkingBeyondMaxOutput(buildThinkingProviderOptions(config.model, config.thinking, max));
+  const floor = Math.min(ceiling, MIN_SPEND_CALL_OUTPUT_TOKENS);
+  const grant = config.spend.check({
+    inputTokens: projected,
+    maxOutputTokens: ceiling + beyond(ceiling),
+    minOutputTokens: floor + beyond(floor),
+  });
+  if ("accountId" in grant) return { spendAccountId: grant.accountId };
+  const fitted = Math.min(ceiling, grant.maxOutputTokens);
+  return { maxOutputTokens: Math.min(fitted, grant.maxOutputTokens - beyond(fitted)) };
+}
+
+/**
+ * Map the AI SDK V4 usage shape into our canonical TokenUsage, plus the
+ * engine-only 1h/5m cache-write split the base V4 struct doesn't carry.
+ * V4's `inputTokens.total` is the grand total (noCache+cacheRead+cacheWrite);
+ * we preserve that on TokenUsage.inputTokens and surface the cache subsets as
+ * siblings. Cost computation subtracts the subsets from the totals — see
+ * src/usage/cost.ts. Anthropic reports the cache-write TTL split under
+ * `raw.cache_creation` (ephemeral_1h vs ephemeral_5m). We tier TTL by
+ * breakpoint (1h on system+tools, 5m on the rolling history — see
+ * model/cache-policy.ts), so capture the 1-hour portion for accurate costing.
+ * Absent for providers that don't report it.
+ */
+function computeTurnUsage(usage: StreamResult["usage"]): TokenUsage {
+  const rawCreation = (
+    usage.raw as { cache_creation?: { ephemeral_1h_input_tokens?: number } } | undefined
+  )?.cache_creation;
+  const cacheWrite1h = rawCreation?.ephemeral_1h_input_tokens;
+  return {
+    ...tokenUsageFromV4(usage),
+    ...(cacheWrite1h != null ? { cacheWrite1hTokens: cacheWrite1h } : {}),
+  };
+}
+
+/** Parse a tool call's `input` into an object, tolerating the stream's JSON-string form. */
+function parseToolCallInput(input: LanguageModelV4ToolCall["input"]): Record<string, unknown> {
+  return (typeof input === "string" ? JSON.parse(input) : (input ?? {})) as Record<string, unknown>;
+}
+
+/**
+ * The schema a model call is checked against. The iteration map lacks a tool
+ * promoted by `nb__manage_tools` in this same assistant message, so fall back
+ * to the router-wide map for it.
+ */
+function toolSchemaFor(ctx: ToolExecContext, name: string): ToolSchema | undefined {
+  return ctx.toolSchemaMap.get(name) ?? ctx.allToolSchemaMap.get(name);
+}
+
+/**
+ * Refusal for a call naming a tool without "model" in its `ui.visibility`.
+ * Such a tool is withheld from every list the model sees, and that alone does
+ * not stop a model that names it: an injected instruction can carry the name.
+ * The engine is the host on this door, so the refusal is enforced at the call.
+ */
+function notAvailableToAgent(toolCall: LanguageModelV4ToolCall, call: ToolCall): ToolExecResult {
+  return {
+    toolCall,
+    gatedCall: call,
+    result: {
+      content: textContent(`${call.name} is not available to the agent.`),
+      isError: true,
+    } as ToolResult,
+    ms: 0,
+  };
+}
+
+/**
+ * The refusal for a checked call that repeats the exact call its tool was
+ * tripped on, or null. Compared on the coerced input, which is what the
+ * supervisor observed when it tripped.
+ */
+function repeatOfTrip(
+  toolCall: LanguageModelV4ToolCall,
+  call: ToolCall,
+  ctx: ToolExecContext,
+): ToolExecResult | null {
+  const result = ctx.supervisor.repeatRefusal(call);
+  return result ? { toolCall, gatedCall: call, result, ms: 0 } : null;
+}
+
+/**
+ * The result a held call returns in place of running: an error, because
+ * nothing ran, carrying {@link SKILL_GUIDANCE_PENDING} so task accounting can
+ * tell it from a failure. The guidance follows it in history.
+ */
+function heldResult(toolName: string, delivered: string[], notIncluded: string[]): ToolResult {
+  const left =
+    notIncluded.length > 0
+      ? ` Also bound to this tool but left out to keep this short: ${notIncluded.join(", ")}; load one with nb__use_skill if the job needs it.`
+      : "";
+  return {
+    content: textContent(
+      `Not run: ${toolName} is governed by guidance you have not read yet (${delivered.join(", ")}). ` +
+        `It follows this result. Read it, then call ${toolName} again.${left}`,
+    ),
+    isError: true,
+    structuredContent: {
+      reason: SKILL_GUIDANCE_PENDING,
+      skills: delivered,
+      ...(notIncluded.length > 0 ? { notIncluded } : {}),
+    },
+  };
+}
+
+/** `work`'s value, or null as soon as `signal` aborts. */
+async function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T | null> {
+  if (!signal) return work;
+  if (signal.aborted) return null;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<null>((resolve) => {
+    onAbort = () => resolve(null);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * Turn the iteration's per-tool-call outcomes into the tool-result message parts
+ * fed back to the model plus the ToolCallRecord list for run telemetry.
+ * `modelOutput` is the already-bounded text the model sees (computed once during
+ * execution and persisted on tool.done) — so the live prompt and the replayed
+ * prompt carry the identical bounded result. Early-return paths that skip
+ * execution (e.g. policy-denied) omit it; bound their small result here so the
+ * type stays a string.
+ */
+function buildToolResults(toolResults: ToolExecResult[]): {
+  toolResultParts: LanguageModelV4ToolResultPart[];
+  toolCallRecords: ToolCallRecord[];
+} {
+  const toolResultParts: LanguageModelV4ToolResultPart[] = [];
+  const toolCallRecords: ToolCallRecord[] = [];
+
+  for (const {
+    toolCall,
+    gatedCall,
+    result,
+    ms,
+    resourceUri: uri,
+    resourceLinks: links,
+    modelOutput,
+    held,
+  } of toolResults) {
+    const llmText =
+      modelOutput ??
+      boundToolResultForModel(extractTextForModel(result.content), { hasUiResource: !!uri });
+    toolCallRecords.push({
+      id: toolCall.toolCallId,
+      name: toolCall.toolName,
+      // Reuse the input parsed once in executeToolCall — never re-parse the raw
+      // stream string (a malformed input would throw here and abort the run).
+      input: gatedCall.input,
+      output: llmText,
+      ok: !result.isError,
+      ms,
+      // Surface the structured failure reason (orchestrator routing
+      // classes, etc.) so consumers can tell an unroutable connector
+      // from a tool that ran and errored. See ToolCallRecord.errorReason.
+      ...(result.isError && typeof result.structuredContent?.reason === "string"
+        ? { errorReason: result.structuredContent.reason }
+        : {}),
+      ...(held ? { held } : {}),
+      ...(uri ? { resourceUri: uri } : {}),
+      ...(links && links.length > 0 ? { resourceLinks: links } : {}),
+    });
+
+    toolResultParts.push({
+      type: "tool-result",
+      toolCallId: toolCall.toolCallId,
+      toolName: toolCall.toolName,
+      output: result.isError
+        ? { type: "error-text", value: llmText }
+        : { type: "text", value: llmText },
+    });
+  }
+
+  return { toolResultParts, toolCallRecords };
+}
+
+/**
+ * The iteration count a run reports: the zero-based loop counter plus the
+ * in-progress iteration when the loop exited before the cap.
+ */
+function reportedIterationCount(iteration: number, maxIter: number): number {
+  return iteration + (iteration < maxIter ? 1 : 0);
+}
+
+/** Shape the `run.error` event payload from a thrown value. */
+function buildRunErrorData(runId: string, err: unknown): RunErrorPayload {
+  return {
+    runId,
+    error: err instanceof Error ? err.message : String(err),
+    type: err instanceof Error ? err.constructor.name : "Error",
+  };
+}
+
+/** A surfaced overlay whose body is still being fetched. */
+interface PendingOverlayFetch {
+  data: Omit<ConnectorSkillInjectedPayload, "skillBody">;
+  body: Promise<string | null>;
+  /** Left out by a hold's or the drain's size limit: settled without being delivered. */
+  dropped?: boolean;
+  /** Counted as delivered by some hold, so neither a later hold nor the drain's cap drops it. */
+  kept?: boolean;
+  /** The skill's priority (lower first), for ordering under the drain's cap. */
+  priority: number;
+}
+
+/**
+ * The run's skill-delivery state: which bound skills have reached the model
+ * (or are on their way), which are queued for this iteration's drain, and
+ * which have already held a call. One object per run, shared by the promotion
+ * path, the per-call hold, and the after-call delivery, so the three can never
+ * disagree about what is delivered.
+ */
+interface SkillDelivery {
+  runId: string;
+  candidates: ConnectorSkillCandidate[];
+  /** Delivered earlier in the conversation, or claimed in this run. */
+  injected: Set<string>;
+  /** Claimed this iteration, by name: what a same-message call waits on. Cleared at the drain. */
+  queued: Map<string, PendingOverlayFetch>;
+  /** Every claim of this iteration, settled before the drain. */
+  fetches: PendingOverlayFetch[];
+  /** Skills that have held a call in this run. A skill holds at most once per run. */
+  held: Set<string>;
+  /** Bodies ready to deliver after this iteration's tool results. */
+  pending: ConnectorSkillInjectedPayload[];
+  /** Left out of a hold by its size cap: not delivered, but not offered again this run. */
+  notIncluded: Set<string>;
+}
+
+/**
+ * Most characters of skill guidance one delivery carries, whether a held call
+ * or an iteration's drain: three bodies at the loader's per-skill limit. Skills
+ * past it are recorded as `skill.not_delivered`. A hold names its left-out
+ * skills in the held result, loadable with `nb__use_skill`; the drain makes its
+ * left-out skills eligible again.
+ */
+const MAX_HELD_GUIDANCE_CHARS = 3 * MAX_SKILL_BODY_CHARS;
+
+/** Per-tool-call context shared across an iteration's concurrent executions. */
+interface ToolExecContext {
+  config: EngineConfig;
+  runId: string;
+  toolMeta: Map<string, Record<string, unknown>>;
+  skills: SkillDelivery;
+  toolSchemaMap: Map<string, ToolSchema>;
+  /** Every router tool's schema: validates a call to a tool promoted in the same message. */
+  allToolSchemaMap: Map<string, ToolSchema>;
+  promotedLastUsed: Map<string, number>;
+  bumpUseCounter: () => number;
+  supervisor: RunSupervisor;
+}
+
+/** One tool call's outcome, consumed by buildToolResults to shape history + records. */
+interface ToolExecResult {
+  toolCall: LanguageModelV4ToolCall;
+  gatedCall: ToolCall;
+  result: ToolResult;
+  ms: number;
+  resourceUri?: string;
+  resourceLinks?: ResourceLinkInfo[];
+  modelOutput?: string;
+  /** The call did not run; see {@link SKILL_GUIDANCE_PENDING}. */
+  held?: true;
+}
+
+export class AgentEngine {
+  constructor(
+    private model: LanguageModelV4,
+    private tools: ToolRouter,
+    private events: EventSink,
+  ) {}
+
+  async run(
+    config: EngineConfig,
+    systemPrompt: string,
+    messages: LanguageModelV4Message[],
+    tools: ToolSchema[],
+  ): Promise<EngineResult> {
+    // Never mutate the caller's array
+    const history = [...messages];
+    const maxIter = Math.min(config.maxIterations, MAX_ITERATIONS);
+
+    // Skills bound to tools: guidance delivered ONCE into the conversation
+    // history, never into the cached system prefix, before the call it governs
+    // runs. The first call to a bound tool is held (`holdForGuidance`) until
+    // the body has been read, unless a promotion already delivered it; a call
+    // that runs anyway (a read its server's default binding does not hold, a
+    // hook rename) gets the guidance after it. Bodies drain after the
+    // iteration's tool results, before the model's next action, in the
+    // position the reconstructor replays them into.
+    //
+    // The dedup set is seeded primarily from `alreadyInjectedConnectorSkills`,
+    // which the runtime computes from the UN-rehydrated history:
+    // `rehydrateUserResources` strips message `metadata` (where the synthetic
+    // marker lives) before the engine sees the messages, so scanning `history`
+    // here can't be the sole source on the real chat path. The scan is kept as
+    // a fallback for callers that pass metadata-bearing messages directly (the
+    // engine+store integration test).
+    const connectorSkillCandidates = config.connectorSkillCandidates ?? [];
+    const injectedConnectorSkills = new Set<string>(config.alreadyInjectedConnectorSkills ?? []);
+    seedInjectedConnectorSkills(history, connectorSkillCandidates, injectedConnectorSkills);
+
+    let iteration = 0;
+    const cumulativeUsage: TokenUsage = emptyUsage();
+    let cumulativeLlmMs = 0;
+    let output = "";
+    const allToolCalls: ToolCallRecord[] = [];
+    const { runId = crypto.randomUUID() } = config;
+    const skills: SkillDelivery = {
+      runId,
+      candidates: connectorSkillCandidates,
+      injected: injectedConnectorSkills,
+      queued: new Map(),
+      fetches: [],
+      held: new Set(),
+      pending: [],
+      notIncluded: new Set(),
+    };
+
+    const allRouterTools = await this.tools.availableTools();
+    const { toolMeta, allToolSchemaMap } = buildToolLookups(allRouterTools);
+    // The listing above omits any connector that was not started when the run
+    // began; one that reconnects mid-run is listed by `nb__search`, which
+    // reads live. A promotion that misses re-reads the router, at most once
+    // per iteration, so a hallucinated name cannot turn every add into a full
+    // listing (which may attempt connector starts). The iteration's re-read is
+    // held as one promise, so concurrent misses (tool calls in one message run
+    // in parallel) all wait on the same listing. A failed re-read keeps the
+    // lookups the run already has.
+    let lookupsRefresh: { iteration: number; done: Promise<void> } | undefined;
+    const refreshToolLookups = (): Promise<void> => {
+      if (lookupsRefresh?.iteration !== iteration) {
+        lookupsRefresh = {
+          iteration,
+          done: this.tools.availableTools().then(
+            (fresh) => mergeToolLookups(fresh, toolMeta, allToolSchemaMap),
+            (err) =>
+              log.warn(
+                `[engine] tool lookup refresh failed; keeping the run's lookups — ${err instanceof Error ? err.message : String(err)}`,
+              ),
+          ),
+        };
+      }
+      return lookupsRefresh.done;
+    };
+
+    const directTools = [...tools];
+    const directToolNames = new Set(directTools.map((t) => t.name));
+    // LRU bookkeeping for agent-promoted tools. Initial tools (passed in
+    // `tools`) are NEVER tracked here, so the eviction loop can never
+    // touch them — they're operator-opted-in. Counter is monotonic so
+    // smaller stamp = older, regardless of clock skew or test parallelism.
+    const promotedLastUsed = new Map<string, number>();
+    let useCounter = 0;
+    const bumpUseCounter = () => ++useCounter;
+    const maxActiveTools = config.maxActiveTools ?? DEFAULT_MAX_DIRECT_TOOLS;
+    // No warning when the initial set exceeds the cap: the always-direct kernel
+    // tools alone exceed it, so this is the expected steady state, not a
+    // misconfiguration. The cap only bounds agent-promoted tools — an over-cap
+    // initial set just makes eviction soft (see evictPromotedToolsToCap).
+
+    const toolControls = {
+      addTool: async (toolName: string) => {
+        // Refresh before the active-list check, so an add that interleaves
+        // with another add of the same name across the await still lands there.
+        if (!directToolNames.has(toolName) && !allToolSchemaMap.has(toolName)) {
+          await refreshToolLookups();
+        }
+        if (directToolNames.has(toolName)) {
+          // Already-active tool counts as a "use" — refresh LRU stamp so
+          // re-promoting a recently-used tool doesn't make it look stale.
+          if (promotedLastUsed.has(toolName)) {
+            promotedLastUsed.set(toolName, ++useCounter);
+          }
+          return {
+            ok: true,
+            toolName,
+            changed: false,
+            message: `${toolName} is already available in the active tool list.`,
+          };
+        }
+        const schema = allToolSchemaMap.get(toolName);
+        if (!schema) {
+          return {
+            ok: false,
+            toolName,
+            changed: false,
+            reason: "not_found",
+            message: `${toolName} was not found in the current tool registry. If its connector is starting, try again on a later step.`,
+          };
+        }
+        if (!isModelVisible(schema)) {
+          return {
+            ok: false,
+            toolName,
+            changed: false,
+            reason: "not_model_visible",
+            message: `${toolName} is not visible to the model and cannot be added to the active tool list.`,
+          };
+        }
+        if (config.toolPromotion && !config.toolPromotion.isToolEligible(schema)) {
+          return {
+            ok: false,
+            toolName,
+            changed: false,
+            reason: "not_allowed",
+            message: `${toolName} is not available in the current run.`,
+          };
+        }
+        directTools.push(schema);
+        directToolNames.add(toolName);
+        promotedLastUsed.set(toolName, ++useCounter);
+        this.events.emit({ type: "tool.promoted", data: { runId, toolName } });
+
+        // A promoted tool makes its server's capability live mid-turn — surface that
+        // server's skill guidance once, now, so the model has the workflow before it
+        // starts using the tools (not only when the first one is called at tool.start).
+        // Delivery rides the history tail (cache-safe — never the frozen prefix) and
+        // lands after this iteration's tool results, so the guidance is in context for
+        // the model's next action in THIS run.
+        this.injectConnectorSkillOverlays(skills, toolName);
+
+        // Backstop: cap active tools by evicting LRU agent-promoted entries.
+        // Initial tools are exempt because they're not in `promotedLastUsed`.
+        this.evictPromotedToolsToCap(
+          runId,
+          directTools,
+          directToolNames,
+          promotedLastUsed,
+          maxActiveTools,
+          toolName,
+        );
+        return {
+          ok: true,
+          toolName,
+          changed: true,
+          message: `${toolName} is now available in the active tool list.`,
+        };
+      },
+      removeTool: (toolName: string) => {
+        if (toolName.startsWith("nb__")) {
+          return {
+            ok: false,
+            toolName,
+            changed: false,
+            reason: "system_tool",
+            message: `${toolName} is a system tool and cannot be released.`,
+          };
+        }
+        if (!directToolNames.has(toolName)) {
+          return {
+            ok: true,
+            toolName,
+            changed: false,
+            message: `${toolName} is not in the active tool list.`,
+          };
+        }
+        const idx = directTools.findIndex((t) => t.name === toolName);
+        if (idx >= 0) directTools.splice(idx, 1);
+        directToolNames.delete(toolName);
+        promotedLastUsed.delete(toolName);
+        this.events.emit({ type: "tool.released", data: { runId, toolName } });
+        return {
+          ok: true,
+          toolName,
+          changed: true,
+          message: `${toolName} was removed from the active tool list.`,
+        };
+      },
+    };
+
+    this.events.emit({
+      type: "run.start",
+      data: {
+        runId,
+        model: config.model,
+        maxIterations: maxIter,
+        maxOutputTokens: config.maxOutputTokens,
+        maxInputTokens: config.maxInputTokens,
+        toolCount: tools.length,
+        toolNames: tools.map((t) => t.name),
+        systemPromptLength: systemPrompt.length,
+        systemPrompt,
+        messageCount: messages.length,
+        messageRoles: messages.map((m) => m.role),
+        estimatedMessageTokens: Math.ceil(JSON.stringify(messages).length / 4),
+      },
+    });
+
+    this.emitRunPromptMetadata(runId, config);
+
+    const runStart = performance.now();
+
+    // Per-run loop bounding. Watches tool-result repetition by fingerprint
+    // and replaces the Nth-repeat result with a synth-stop directive that
+    // tells the model to surface the error and end the run. See
+    // src/engine/supervisor.ts for the state machine.
+    const supervisor = createRunSupervisor();
+
+    // Tracks the most recent LLM call's finish reason so the run-level
+    // stop reason can reflect why the model actually exited (length cap,
+    // content filter, etc.) rather than always reporting "complete".
+    let lastFinishReason: FinishReason | undefined;
+    // The same call's provider-native stop reason (see `EngineResult.finishReasonRaw`).
+    let lastFinishReasonRaw: string | undefined;
+    // Input tokens the most recent model call reported. One half of the next
+    // call's projected size for the run cap (see `EngineConfig.maxRunInputTokens`).
+    let lastCallInputTokens = 0;
+    let runInputCapReached = false;
+    // The spend account that would have been overrun by the next call, if any.
+    let spendAccountId: string | undefined;
+
+    const unregisterToolControls = config.toolPromotion?.registerControls(toolControls);
+    try {
+      while (iteration < maxIter) {
+        // Cancellation check at the top of every iteration. Three signal
+        // propagation paths now cover the full agent loop:
+        //
+        //   1. THIS check — between iterations. Catches a cancel that
+        //      fires during a tool call (e.g. an external timeout that
+        //      fires mid-tool); without it, the engine would proceed to
+        //      the next LLM round-trip after the cancelled tool.
+        //   2. `tools.execute(call, config.signal)` — in-flight tool.
+        //      Task-augmented MCP tools get `tasks/cancel`; inline ones
+        //      abort their RPC.
+        //   3. `callModel(..., { abortSignal: config.signal })` below —
+        //      in-flight LLM stream. The provider aborts the underlying
+        //      fetch on signal, so a long completion or reasoning-heavy
+        //      run cancels at the network layer instead of blocking
+        //      until the model finishes.
+        //
+        // Cooperative throughout: we never preempt running work, just
+        // stop starting new work. The run's catch below ends an aborted
+        // run with `run.done` stopReason "cancelled" and rethrows.
+        throwIfAborted(config.signal);
+
+        // Offer the history this loop has grown back to the caller, which may
+        // return a smaller one to run with from here on (the runtime folds an
+        // over-budget history into a summary — see `runtime/mid-turn-compaction`).
+        await this.applyHistoryRewrite(history, iteration, config);
+
+        // Drop any tool the supervisor currently has tripped and build the
+        // per-iteration model toolset + schema lookup.
+        const { modelTools, toolSchemaMap } = this.buildIterationTools(directTools, supervisor);
+
+        // 1. Apply context/prompt hooks and call LLM. The transformContext
+        //    hook is also re-invoked on a context-overflow recovery (see
+        //    the call loop below) with `overflowAttempt: 1` so the hook
+        //    can return more aggressively trimmed messages.
+        const runTransform = (attempt: number): LanguageModelV4Message[] =>
+          config.hooks?.transformContext
+            ? config.hooks.transformContext([...history], { overflowAttempt: attempt })
+            : history;
+        const windowed = runTransform(0);
+        // Sanitize: filter out empty text content blocks that the API rejects
+        let callMessages = sanitizeMessages(windowed);
+        const callPrompt = resolveCallPrompt(config, systemPrompt);
+
+        const finalStep =
+          iteration === maxIter - 1 ||
+          nearRunInputCap(config, {
+            spentInput: cumulativeUsage.inputTokens,
+            lastCallInputTokens,
+            estimate: () =>
+              estimatePromptTokens(
+                [{ role: "system", content: callPrompt }, ...callMessages],
+                modelTools,
+              ),
+          });
+        callMessages = appendFinalStepReminder(callMessages, finalStep);
+
+        // The run-wide input cap and the spend accounts, checked against the
+        // prompt about to be sent, before it is sent.
+        const preCallStop = checkBeforeCall(config, {
+          spentInput: cumulativeUsage.inputTokens,
+          lastCallInputTokens,
+          estimate: () =>
+            estimatePromptTokens(
+              [{ role: "system", content: callPrompt }, ...callMessages],
+              modelTools,
+            ),
+        });
+        if (preCallStop === "max_input_tokens") {
+          runInputCapReached = true;
+          break;
+        }
+        if ("spendAccountId" in preCallStop) {
+          spendAccountId = preCallStop.spendAccountId;
+          break;
+        }
+        // The model's ceiling, or less when the spend accounts allow less.
+        const callMaxOutputTokens = preCallStop.maxOutputTokens;
+
+        const callProviderOptions = buildThinkingProviderOptions(
+          config.model,
+          config.thinking,
+          callMaxOutputTokens,
+        );
+
+        const callProvider = getProviderFromModel(config.model);
+        // Pre-flight estimate of the prompt the provider is actually sent, in
+        // the same units the windowing budget is enforced in. Set inside
+        // `callOnce` so an overflow re-window updates it, and read at
+        // `llm.done` alongside the provider's reported usage — the pair is
+        // what makes estimator drift measurable instead of inferred.
+        let estimatedInputTokens = 0;
+        const callOnce = (msgs: LanguageModelV4Message[]) => {
+          // Provider-scoped prompt-cache policy: places the rolling step-anchor
+          // + tail breakpoints (Anthropic) so the growing prefix is read back,
+          // not re-written, each iteration. See model/cache-policy.ts.
+          //
+          // A cache read assumes the prefix is append-only: the rolling anchor
+          // must stay byte-identical to the prior call's tail, which is why
+          // transformContext windows rather than rewrites. `rewriteHistory`
+          // breaks that on purpose — the iteration it fires reads nothing and
+          // writes the shortened prefix, which then holds until the next
+          // rewrite (degraded for one call, never incorrect). That one-time
+          // cost is what bounds the rewrite rate.
+          const { prompt: cachedPrompt, tools: cachedTools } = applyCachePolicy({
+            provider: callProvider,
+            systemPrompt: callPrompt,
+            messages: msgs,
+            tools: modelTools,
+          });
+          // `cachedPrompt` is the full prompt array (system message +
+          // messages), so this covers everything billed as input except the
+          // provider's own per-request overhead.
+          estimatedInputTokens = estimatePromptTokens(cachedPrompt, cachedTools);
+          return withRetry(
+            () =>
+              callModel(
+                this.model,
+                {
+                  prompt: cachedPrompt,
+                  tools: cachedTools,
+                  maxOutputTokens: callMaxOutputTokens,
+                  // Forward the run-scoped signal into the model call. AI
+                  // SDK V4 providers honor `abortSignal` by aborting the
+                  // underlying fetch, so an in-flight stream cancels at
+                  // the network layer instead of blocking the engine
+                  // until the model finishes. Pairs with the iteration-
+                  // boundary check above: that handles between-step
+                  // cancellation, this handles in-step.
+                  ...(config.signal ? { abortSignal: config.signal } : {}),
+                  ...(Object.keys(callProviderOptions).length > 0
+                    ? { providerOptions: callProviderOptions }
+                    : {}),
+                },
+                (text) => this.events.emit({ type: "text.delta", data: { runId, text } }),
+                (text) => this.events.emit({ type: "reasoning.delta", data: { runId, text } }),
+                (id, name) =>
+                  this.events.emit({ type: "tool.preparing", data: { runId, id, name } }),
+                (id) => this.events.emit({ type: "tool.preparing.done", data: { runId, id } }),
+              ),
+            // Defaults preserved; only the new fourth arg matters here.
+            // The retry backoff sleep aborts on `config.signal` so a
+            // cancel during backoff bites within the abort tick instead
+            // of after the full delay (up to ~8.5s on attempt 3).
+            3,
+            1000,
+            config.signal,
+          );
+        };
+
+        const llmStart = performance.now();
+        const response = await this.callModelWithOverflowRecovery(
+          callOnce,
+          callMessages,
+          runTransform,
+          config,
+          runId,
+        );
+        const llmMs = Math.round(performance.now() - llmStart);
+
+        // Accumulate text output (add newline between turns if needed).
+        output = this.accumulateAssistantText(output, response.content, runId);
+
+        const turnUsage = computeTurnUsage(response.usage);
+        addUsage(cumulativeUsage, turnUsage);
+        config.spend?.debit(turnUsage);
+        lastCallInputTokens = turnUsage.inputTokens;
+        cumulativeLlmMs += llmMs;
+
+        // Track the model's per-call finish reason for downstream
+        // observability and the run-level stop reason derivation below.
+        // `unified` is non-optional in the V4 spec and stream.ts defaults
+        // to "other" if no finish part arrives, so no fallback needed.
+        lastFinishReason = response.finishReason.unified;
+        const rawFinish = rawFinishReasonField(response.finishReason.raw);
+        lastFinishReasonRaw = rawFinish.finishReasonRaw;
+
+        // Record the atomic LLM call fact
+        this.events.emit({
+          type: "llm.done",
+          data: {
+            runId,
+            model: config.model,
+            content: response.content,
+            usage: turnUsage,
+            llmMs,
+            // Time-to-first-token of the successful provider call (connect +
+            // prefill), distinct from `llmMs` (whole round-trip incl. decode).
+            // Absent when the call emitted no output part.
+            ttftMs: response.ttftMs,
+            // The pre-flight estimate for this same call. Paired with
+            // `usage.inputTokens`, it is the estimator's error on real
+            // traffic — the signal a calibrated budget would learn from, and
+            // the one that separates an under-counting estimator from
+            // windowing that returned over budget.
+            estimatedInputTokens,
+            finishReason: lastFinishReason,
+            ...rawFinish,
+          },
+        });
+
+        // 2. Extract tool calls
+        const toolCalls = response.content.filter(
+          (b): b is LanguageModelV4ToolCall => b.type === "tool-call",
+        );
+
+        if (toolCalls.length === 0) {
+          // A turn with no tool call ends the run. A `finishReason: "length"`
+          // turn (cut off at the output ceiling) ends it too, surfacing as
+          // stopReason "length": resuming it would send a history that ends
+          // on the partial assistant message, which is an assistant prefill
+          // that current Anthropic models reject with a 400. The user sends
+          // another message to continue.
+          break; // Model is done
+        }
+
+        // 4. Append assistant message to history.
+        // `normalizeForReplay` handles the stream→prompt shape mismatches
+        // (tool-call input string→object, providerMetadata→providerOptions
+        // on every content type). See src/model/inbound-fit.ts.
+        const historyContent = normalizeForReplay(response.content);
+        history.push({ role: "assistant", content: historyContent });
+
+        // 5. Execute tools in PARALLEL (sync + task-augmented concurrently, §13)
+        const toolExecContext: ToolExecContext = {
+          config,
+          runId,
+          toolMeta,
+          skills,
+          toolSchemaMap,
+          allToolSchemaMap,
+          promotedLastUsed,
+          bumpUseCounter,
+          supervisor,
+        };
+        const toolResults = await this.executeToolCallsBounded(toolCalls, toolExecContext);
+
+        // Build result arrays from parallel results. `modelOutput` is the
+        // already-bounded text the model sees (computed once, during execution,
+        // and persisted on tool.done) — so the live prompt and the replayed
+        // prompt carry the identical bounded result.
+        const { toolResultParts, toolCallRecords } = buildToolResults(toolResults);
+        allToolCalls.push(...toolCallRecords);
+
+        // 6. Feed results back as tool message
+        history.push({ role: "tool", content: toolResultParts });
+
+        // 7. Deliver any overlay surfaced while those tools ran, in the same
+        // position the reconstructor will replay it into — after this
+        // iteration's tool results. The model reads the guidance before its
+        // next action, which is what "surface on first use" means. Recording
+        // the event here and leaving the body to a later rehydration would
+        // deliver it after the calls it governs had already happened, and a
+        // single-run conversation would never see it at all.
+        //
+        // The role is `user`, not `assistant`, and that is load-bearing: this
+        // message ENDS the history for the next model call of this same run,
+        // and a trailing assistant message is an Anthropic prefill — the model
+        // continues the guidance block instead of starting its own turn, and
+        // that continuation is its real, user-visible output. `user` is the
+        // role the codebase already injects synthetic non-user guidance under
+        // (see `appendFinalStepReminder`), and it is trailing-safe.
+        // An overlay whose body is fetched on demand (a server-published
+        // skill) is recorded once its body is in hand. It is recorded before
+        // the next `llm.response`, the same iteration the injector fired in,
+        // so replay places it where the live run does. A body that cannot be
+        // fetched is not delivered, and the skill stays eligible.
+        await this.settleOverlayFetches(skills);
+        for (const overlay of skills.pending) {
+          history.push({
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: formatConnectorSkillBlock(
+                  overlay.skillName,
+                  overlay.scope,
+                  overlay.skillBody,
+                  overlay.heldToolCallId !== undefined,
+                ),
+              },
+            ],
+          });
+        }
+        skills.pending.length = 0;
+        skills.queued.clear();
+
+        iteration++;
+      }
+    } catch (err) {
+      this.emitThrownRunEnd({ runId, err, signal: config.signal, iteration, maxIter, runStart });
+      throw err;
+    } finally {
+      unregisterToolControls?.();
+    }
+
+    const totalMs = Math.round(performance.now() - runStart);
+    return this.finishRun({
+      runId,
+      iteration,
+      maxIter,
+      runInputCapReached,
+      spendAccountId,
+      lastFinishReason,
+      lastFinishReasonRaw,
+      totalMs,
+      output,
+      allToolCalls,
+      cumulativeUsage,
+      cumulativeLlmMs,
+    });
+  }
+
+  /**
+   * Emit the terminal event for a run whose loop threw. When the run's abort
+   * signal fired, whatever the cause, the run was stopped rather than failed,
+   * so it ends with `run.done` stopReason "cancelled" rather than `run.error`. The caller still rethrows: callers
+   * classify the abort themselves.
+   */
+  private emitThrownRunEnd(params: {
+    runId: string;
+    err: unknown;
+    signal: AbortSignal | undefined;
+    iteration: number;
+    maxIter: number;
+    runStart: number;
+  }): void {
+    const { runId, err, signal, iteration, maxIter, runStart } = params;
+    if (signal?.aborted) {
+      this.events.emit({
+        type: "run.done",
+        data: {
+          runId,
+          stopReason: "cancelled" satisfies StopReason,
+          iterations: reportedIterationCount(iteration, maxIter),
+          totalMs: Math.round(performance.now() - runStart),
+        },
+      });
+      return;
+    }
+    this.events.emit({ type: "run.error", data: buildRunErrorData(runId, err) });
+  }
+
+  /**
+   * Emit `run.done` and assemble the EngineResult: the run-level stop reason
+   * (run input cap, then spend account, then iteration cap, then the model-driven exit) and the reported
+   * iteration count (which includes the in-progress iteration when the loop
+   * exited before the cap).
+   */
+  private finishRun(params: {
+    runId: string;
+    iteration: number;
+    maxIter: number;
+    runInputCapReached: boolean;
+    spendAccountId: string | undefined;
+    lastFinishReason: FinishReason | undefined;
+    lastFinishReasonRaw: string | undefined;
+    totalMs: number;
+    output: string;
+    allToolCalls: ToolCallRecord[];
+    cumulativeUsage: TokenUsage;
+    cumulativeLlmMs: number;
+  }): EngineResult {
+    const {
+      runId,
+      iteration,
+      maxIter,
+      runInputCapReached,
+      spendAccountId,
+      lastFinishReason,
+      lastFinishReasonRaw,
+      totalMs,
+      output,
+      allToolCalls,
+      cumulativeUsage,
+      cumulativeLlmMs,
+    } = params;
+    const stopReason: StopReason = runInputCapReached
+      ? "max_input_tokens"
+      : spendAccountId !== undefined
+        ? "spend_limit"
+        : iteration >= maxIter
+          ? "max_iterations"
+          : deriveStopReason(lastFinishReason);
+    // A cap or spend stop breaks before its iteration's model call, so every
+    // counted iteration is complete.
+    const reportedIterations =
+      runInputCapReached || spendAccountId !== undefined
+        ? iteration
+        : reportedIterationCount(iteration, maxIter);
+    this.events.emit({
+      type: "run.done",
+      data: {
+        runId,
+        stopReason,
+        iterations: reportedIterations,
+        totalMs,
+      },
+    });
+
+    return {
+      output,
+      toolCalls: allToolCalls,
+      iterations: reportedIterations,
+      usage: cumulativeUsage,
+      llmMs: cumulativeLlmMs,
+      stopReason,
+      ...(lastFinishReason !== undefined ? { finishReason: lastFinishReason } : {}),
+      ...(lastFinishReasonRaw !== undefined ? { finishReasonRaw: lastFinishReasonRaw } : {}),
+      ...(spendAccountId !== undefined ? { spendAccountId } : {}),
+    };
+  }
+
+  /**
+   * Emit the run-scope telemetry the runtime pre-computed
+   * (skills.loaded and context.assembled). Tied to the same `runId` as
+   * `run.start` so the conversation log records what the prompt looked like for
+   * this turn.
+   */
+  private emitRunPromptMetadata(runId: string, config: EngineConfig): void {
+    if (config.runMetadata?.skillsLoaded) {
+      this.events.emit({
+        type: "skills.loaded",
+        data: {
+          runId,
+          skills: config.runMetadata.skillsLoaded.skills,
+          totalTokens: config.runMetadata.skillsLoaded.totalTokens,
+        },
+      });
+    }
+    if (config.runMetadata?.contextAssembled) {
+      this.events.emit({
+        type: "context.assembled",
+        data: {
+          runId,
+          sources: config.runMetadata.contextAssembled.sources,
+          excluded: config.runMetadata.contextAssembled.excluded,
+          totalTokens: config.runMetadata.contextAssembled.totalTokens,
+          ...(config.runMetadata.contextAssembled.modelMaxContext !== undefined
+            ? { modelMaxContext: config.runMetadata.contextAssembled.modelMaxContext }
+            : {}),
+          ...(config.runMetadata.contextAssembled.headroomTokens !== undefined
+            ? { headroomTokens: config.runMetadata.contextAssembled.headroomTokens }
+            : {}),
+        },
+      });
+    }
+  }
+
+  /**
+   * Hand the loop's accumulated history to `rewriteHistory` and adopt whatever
+   * comes back, in place — `history` is the array every later append and
+   * transform reads, so a returned copy has to land in it, not beside it.
+   *
+   * No-op before the first iteration completes: the caller composed the opening
+   * history itself, so only what the loop appended since is new information.
+   */
+  private async applyHistoryRewrite(
+    history: LanguageModelV4Message[],
+    iteration: number,
+    config: EngineConfig,
+  ): Promise<void> {
+    if (iteration === 0 || !config.hooks?.rewriteHistory) return;
+    const rewritten = await config.hooks.rewriteHistory([...history], {
+      iteration,
+      ...(config.signal ? { signal: config.signal } : {}),
+    });
+    if (rewritten) history.splice(0, history.length, ...rewritten);
+  }
+
+  /**
+   * Build the per-iteration model toolset and name→schema lookup. Filters out
+   * any tool the supervisor currently has tripped: withholding the tool from
+   * the model's toolset is more reliable than telling the model "do not call
+   * this tool" via prose, because it isn't there to pick. Other tools remain
+   * available so the run can recover. Rebuilt every iteration from a fresh
+   * `snapshot()`, so a tool the supervisor un-trips comes back on its own.
+   */
+  private buildIterationTools(
+    directTools: ToolSchema[],
+    supervisor: RunSupervisor,
+  ): { modelTools: LanguageModelV4FunctionTool[]; toolSchemaMap: Map<string, ToolSchema> } {
+    const trippedSet = new Set(supervisor.snapshot().trippedTools);
+    const usableDirectTools =
+      trippedSet.size === 0 ? directTools : directTools.filter((t) => !trippedSet.has(t.name));
+    const modelTools: LanguageModelV4FunctionTool[] = usableDirectTools.map((t) => ({
+      type: "function" as const,
+      name: t.name,
+      description: t.description,
+      inputSchema: toolSchemaForLlm(t.inputSchema, t.name) as JSONSchema7,
+    }));
+
+    const toolSchemaMap = new Map<string, ToolSchema>();
+    for (const t of usableDirectTools) {
+      toolSchemaMap.set(t.name, t);
+    }
+
+    return { modelTools, toolSchemaMap };
+  }
+
+  /**
+   * Backstop for the active-tool cap: evict LRU agent-promoted entries until the
+   * set fits `maxActiveTools`. Initial tools are exempt because they're not in
+   * `promotedLastUsed`. Defensive guard: if the just-added tool would be its own
+   * eviction victim (only possible when initial tools alone already exceed the
+   * cap, so promotedLastUsed has only this one entry), break out. Cap is "soft"
+   * in that pathological config — the alternative would be silently undoing the
+   * agent's intentional promotion, which is worse than letting the cap stretch
+   * by one.
+   */
+  private evictPromotedToolsToCap(
+    runId: string,
+    directTools: ToolSchema[],
+    directToolNames: Set<string>,
+    promotedLastUsed: Map<string, number>,
+    maxActiveTools: number,
+    justAddedToolName: string,
+  ): void {
+    while (directTools.length > maxActiveTools && promotedLastUsed.size > 0) {
+      let oldestName: string | null = null;
+      let oldestStamp = Number.POSITIVE_INFINITY;
+      for (const [name, stamp] of promotedLastUsed) {
+        if (stamp < oldestStamp) {
+          oldestStamp = stamp;
+          oldestName = name;
+        }
+      }
+      if (!oldestName || oldestName === justAddedToolName) break;
+      const idx = directTools.findIndex((t) => t.name === oldestName);
+      if (idx >= 0) directTools.splice(idx, 1);
+      directToolNames.delete(oldestName);
+      promotedLastUsed.delete(oldestName);
+      this.events.emit({
+        type: "tool.released",
+        data: { runId, toolName: oldestName, reason: "evicted" },
+      });
+    }
+  }
+
+  /**
+   * Call the model once, recovering from a single provider-reported
+   * context-window overflow. The pre-flight `resolveMessageBudget` should make
+   * this rare; when it fires, we re-window with the hook's own
+   * `overflowAttempt`-driven scaling (typically halves the budget) and retry
+   * once. A second overflow propagates the original error so the UI can surface
+   * a clear "conversation too long" message rather than silently looping.
+   */
+  private async callModelWithOverflowRecovery(
+    callOnce: (msgs: LanguageModelV4Message[]) => Promise<StreamResult>,
+    initialMessages: LanguageModelV4Message[],
+    runTransform: (attempt: number) => LanguageModelV4Message[],
+    config: EngineConfig,
+    runId: string,
+  ): Promise<StreamResult> {
+    let callMessages = initialMessages;
+    let overflowAttempt = 0;
+    while (true) {
+      try {
+        return await callOnce(callMessages);
+      } catch (err) {
+        if (
+          overflowAttempt === 0 &&
+          isContextOverflowError(err) &&
+          config.hooks?.transformContext
+        ) {
+          overflowAttempt = 1;
+          const previousMessageCount = callMessages.length;
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          // Always-on stderr line so a frequency uptick is visible in
+          // operator logs without flipping a debug flag. Recovery
+          // firing means the pre-flight budget composition disagreed
+          // with the provider's tokenizer — actionable signal for
+          // tuning BUDGET_SAFETY_MARGIN_RATIO or the
+          // estimator. Per-conversation correlation via runId; the
+          // aggregate is what drives action.
+          log.warn(
+            `[engine] context overflow recovery runId=${runId} attempt=${overflowAttempt} previousMessages=${previousMessageCount} model=${config.model} error="${errorMessage}"`,
+          );
+          this.events.emit({
+            type: "context.overflow_recovery",
+            data: {
+              runId,
+              attempt: overflowAttempt,
+              previousMessageCount,
+              errorMessage,
+            },
+          });
+          callMessages = sanitizeMessages(runTransform(overflowAttempt));
+          continue;
+        }
+        // Terminal LLM failure: the call threw, in-call retry is exhausted,
+        // and it's neither a recoverable overflow nor a user cancellation.
+        // Emit the observe-only error fact (for the LLM error-rate metric)
+        // before re-throwing — the error still propagates and ends the run.
+        // Aborts are excluded: a cancellation isn't a provider failure and
+        // must not inflate the error rate.
+        if (!config.signal?.aborted) {
+          this.events.emit({
+            type: "llm.error",
+            data: { runId, model: config.model },
+          });
+        }
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Append this turn's assistant text to the running output, emitting the
+   * inter-turn separator (`\n\n`) when needed. Returns the new output.
+   */
+  private accumulateAssistantText(
+    currentOutput: string,
+    content: LanguageModelV4Content[],
+    runId: string,
+  ): string {
+    let output = currentOutput;
+    for (const block of content) {
+      if (block.type === "text") {
+        if (output.length > 0 && !output.endsWith("\n") && block.text.length > 0) {
+          output += "\n\n";
+          this.events.emit({ type: "text.delta", data: { runId, text: "\n\n" } });
+        }
+        output += block.text;
+      }
+    }
+    return output;
+  }
+
+  /**
+   * Deliver, after the call, every undelivered skill bound to `toolName`: the
+   * path for a promotion (the guidance lands before the model's next action,
+   * ahead of any call it makes to the promoted tool), and for a call that ran
+   * without being held — a read its server's own default binding does not
+   * hold, a call renamed past the hold, or a skill whose hold already happened
+   * this run. Synchronous between the check and the claim, so parallel calls
+   * cannot both claim one skill.
+   */
+  private injectConnectorSkillOverlays(skills: SkillDelivery, toolName: string): void {
+    for (const candidate of skills.candidates) {
+      if (skills.injected.has(candidate.name)) continue;
+      if (!candidate.toolAffinity.some((p) => toolMatches(toolName, p))) continue;
+      this.claimSkill(skills, candidate, toolName);
+    }
+  }
+
+  /**
+   * Claim one skill for this iteration's drain: mark it delivered, start
+   * fetching its body, and queue it, so a call in the same message waits on
+   * the same fetch instead of running ahead of it. Synchronous.
+   */
+  private claimSkill(
+    skills: SkillDelivery,
+    candidate: ConnectorSkillCandidate,
+    toolName: string,
+    heldToolCallId?: string,
+  ): PendingOverlayFetch {
+    skills.injected.add(candidate.name);
+    const claim: PendingOverlayFetch = {
+      data: {
+        runId: skills.runId,
+        toolName,
+        skillName: candidate.name,
+        scope: candidate.scope,
+        ...(heldToolCallId !== undefined ? { heldToolCallId } : {}),
+      },
+      priority: candidate.priority ?? 50,
+      body: candidate.loadBody
+        ? candidate.loadBody().catch(() => null)
+        : Promise.resolve(candidate.body || null),
+    };
+    skills.fetches.push(claim);
+    skills.queued.set(candidate.name, claim);
+    return claim;
+  }
+
+  /**
+   * Settle this iteration's claims before the drain: record each body that
+   * arrived (`connector.skill.injected`) and queue it for delivery; record a
+   * body that did not arrive (`skill.not_delivered`) and make its skill
+   * eligible again. A claim a hold dropped for size is neither. Emitted before
+   * the next `llm.response`, so replay places each body where the live run did.
+   *
+   * One drain delivers at most {@link MAX_HELD_GUIDANCE_CHARS}, whichever path
+   * claimed its skills (a hold, a promotion, or a call that ran): bodies a hold
+   * already counted first, then the rest by priority. A body past the cap is
+   * recorded `capped` and made eligible again, so a later hold for the tool it
+   * governs, or a later drain, still delivers it: the cap bounds one delivery,
+   * it does not withhold guidance. The first body always fits, so a drain is
+   * never empty for size alone.
+   */
+  private async settleOverlayFetches(skills: SkillDelivery): Promise<void> {
+    const claims = skills.fetches
+      .filter((c) => !c.dropped)
+      .sort(
+        (a, b) =>
+          Number(Boolean(b.kept)) - Number(Boolean(a.kept)) ||
+          a.priority - b.priority ||
+          (a.data.skillName < b.data.skillName ? -1 : a.data.skillName > b.data.skillName ? 1 : 0),
+      );
+    let chars = 0;
+    let delivered = 0;
+    for (const claim of claims) {
+      const skillBody = await claim.body;
+      if (skillBody !== null && !claim.kept && delivered > 0) {
+        if (chars + skillBody.length > MAX_HELD_GUIDANCE_CHARS) {
+          claim.dropped = true;
+          skills.injected.delete(claim.data.skillName);
+          this.emitNotDelivered(skills.runId, claim.data.toolName, claim.data.skillName, "capped");
+          continue;
+        }
+      }
+      if (skillBody === null) {
+        skills.injected.delete(claim.data.skillName);
+        this.emitNotDelivered(
+          skills.runId,
+          claim.data.toolName,
+          claim.data.skillName,
+          "fetch_failed",
+        );
+        continue;
+      }
+      const data = { ...claim.data, skillBody };
+      this.events.emit({ type: "connector.skill.injected", data });
+      skills.pending.push(data);
+      chars += skillBody.length;
+      delivered += 1;
+    }
+    skills.fetches.length = 0;
+  }
+
+  private emitNotDelivered(
+    runId: string,
+    toolName: string,
+    skillName: string,
+    reason: SkillNotDeliveredPayload["reason"],
+  ): void {
+    this.events.emit({ type: "skill.not_delivered", data: { runId, toolName, skillName, reason } });
+  }
+
+  /**
+   * Skills bound to `call` whose guidance must reach the model before the call
+   * runs, in delivery order. A skill qualifies when it is undelivered and has
+   * not held a call this run, or when it is queued this iteration. A skill
+   * bound only by its server's implicit whole-server default does not qualify
+   * on a tool that server annotates read-only: the annotation is the server's
+   * claim about itself, so it may waive only that server's own default.
+   */
+  private boundSkills(
+    skills: SkillDelivery,
+    toolName: string,
+    readOnly: boolean,
+  ): ConnectorSkillCandidate[] {
+    return skills.candidates
+      .filter((c) => c.toolAffinity.some((p) => toolMatches(toolName, p)))
+      .filter((c) => !(readOnly && c.implicitBinding))
+      .filter(
+        (c) =>
+          skills.queued.has(c.name) || (!skills.injected.has(c.name) && !skills.held.has(c.name)),
+      )
+      .sort(
+        (a, b) =>
+          (a.priority ?? 50) - (b.priority ?? 50) ||
+          (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+      );
+  }
+
+  /**
+   * Hold `call` when a skill bound to its tool has not reached the model yet:
+   * return the result the model sees instead of running it, or null to let it
+   * run. The bound skills are claimed synchronously, before the first await,
+   * so a parallel call to a tool they bind waits on the same fetches. The call
+   * is held only when at least one body arrives; when none does, it runs, and
+   * each missing body is recorded. Bodies past {@link MAX_HELD_GUIDANCE_CHARS}
+   * are left out and named.
+   */
+  private async holdForGuidance(call: ToolCall, ctx: ToolExecContext): Promise<ToolResult | null> {
+    const { skills } = ctx;
+    const readOnly = ctx.allToolSchemaMap.get(call.name)?.annotations?.readOnlyHint === true;
+    const bound = this.boundSkills(skills, call.name, readOnly);
+    if (bound.length === 0) return null;
+
+    const claims = bound.map((c) => {
+      const queued = skills.queued.get(c.name);
+      if (queued) return { name: c.name, claim: queued };
+      skills.held.add(c.name);
+      return { name: c.name, claim: this.claimSkill(skills, c, call.name, call.id) };
+    });
+    const bodies = await raceAbort(
+      Promise.all(claims.map(({ claim }) => claim.body)),
+      ctx.config.signal,
+    );
+    // A cancelled run ends here: the call neither runs nor waits for its guidance.
+    throwIfAborted(ctx.config.signal);
+    if (bodies === null) return null;
+
+    const delivered: string[] = [];
+    const notIncluded: string[] = [];
+    let chars = 0;
+    claims.forEach(({ name, claim }, i) => {
+      const body = bodies[i];
+      if (body === null || body === undefined || claim.dropped) return;
+      if (!claim.kept && delivered.length > 0 && chars + body.length > MAX_HELD_GUIDANCE_CHARS) {
+        claim.dropped = true;
+        skills.notIncluded.add(name);
+        notIncluded.push(name);
+        this.emitNotDelivered(skills.runId, call.name, name, "capped");
+        return;
+      }
+      claim.kept = true;
+      chars += body.length;
+      delivered.push(name);
+    });
+    if (delivered.length === 0) return null;
+    return heldResult(call.name, delivered, notIncluded);
+  }
+
+  /**
+   * Record a skill activation a tool result declares via the
+   * {@link SKILL_ACTIVATED_META_KEY} `_meta` marker (the `nb__use_skill` tool):
+   * emit `skill.activated` through the run's sinks (persisting it into the
+   * conversation log for telemetry + the cross-turn already-delivered check)
+   * and add the name to the run's injected set so the surface-once overlay
+   * path never delivers the same guidance a second time within this run.
+   * Sync between the has-check and the add, same as the overlay injector, so
+   * parallel activations of one skill can't double-emit. Ignores results that
+   * don't carry a well-formed marker.
+   */
+  private recordSkillActivation(
+    ctx: ToolExecContext,
+    gatedCall: ToolCall,
+    result: ToolResult,
+  ): void {
+    const raw = result._meta?.[SKILL_ACTIVATED_META_KEY];
+    if (!raw || typeof raw !== "object") return;
+    const marker = raw as { skillName?: unknown; scope?: unknown; tokens?: unknown };
+    if (typeof marker.skillName !== "string" || marker.skillName.length === 0) return;
+    const { skills } = ctx;
+    if (skills.injected.has(marker.skillName) && !skills.notIncluded.has(marker.skillName)) return;
+    skills.injected.add(marker.skillName);
+    skills.notIncluded.delete(marker.skillName);
+    this.events.emit({
+      type: "skill.activated",
+      data: {
+        runId: ctx.runId,
+        toolCallId: gatedCall.id,
+        skillName: marker.skillName,
+        scope: typeof marker.scope === "string" ? marker.scope : "org",
+        tokens: typeof marker.tokens === "number" ? marker.tokens : 0,
+      },
+    });
+  }
+
+  /**
+   * Turn a {@link SKILL_SUPPRESSION_META_KEY} marker into a persisted
+   * `skill.suppression` event. Mirrors {@link recordSkillActivation}: only the
+   * engine knows the runId, and only the conversation log outlives the run.
+   *
+   * Unlike an activation, this is NOT added to the run's injected set — that
+   * set exists to stop a body being delivered twice, and a suppression
+   * delivers nothing. Suppressing then re-activating a skill in one run must
+   * both take effect, in order.
+   */
+  private recordSkillSuppression(result: ToolResult, runId: string): void {
+    const raw = result._meta?.[SKILL_SUPPRESSION_META_KEY];
+    if (!raw || typeof raw !== "object") return;
+    const marker = raw as { skillName?: unknown; suppressed?: unknown };
+    if (typeof marker.skillName !== "string" || marker.skillName.length === 0) return;
+    this.events.emit({
+      type: "skill.suppression",
+      data: { runId, skillName: marker.skillName, suppressed: marker.suppressed === true },
+    });
+  }
+
+  /**
+   * Emit `tool.progress` when a tool result was bounded for model context.
+   * `outputText` (full) is persisted for the UI and the record; `modelOutput`
+   * (bounded) is what enters the prompt. The message differs for inline-UI
+   * results (pointer) vs. persisted results. No-op when the result was not
+   * bounded.
+   */
+  private emitToolResultBoundedProgress(
+    bounded: boolean,
+    runId: string,
+    id: string,
+    resourceUri: string | undefined,
+    outputText: string,
+    modelOutput: string,
+  ): void {
+    if (!bounded) return;
+    this.events.emit({
+      type: "tool.progress",
+      data: {
+        runId,
+        id,
+        message: resourceUri
+          ? `Tool result bounded for model context (${outputText.length.toLocaleString()} chars → pointer). Full result rendered in inline UI.`
+          : `Tool result bounded for model context (${outputText.length.toLocaleString()} chars → ${modelOutput.length.toLocaleString()}). Full result persisted for the UI.`,
+      },
+    });
+  }
+
+  /**
+   * Execute one iteration's tool calls, grouped by source and bounded within
+   * each group. See {@link MAX_PARALLEL_TOOL_CALLS_PER_SOURCE_PER_RUN} for the
+   * scope this does and does not enforce.
+   *
+   * The grouping key is the source prefix `ToolRegistry.execute` routes on — the
+   * same first-`__` split every dispatch door performs, though each hand-rolls
+   * it rather than sharing one function, so the correspondence is CONVENTION,
+   * not enforcement: changing the decomposition means changing every site, or
+   * this grouping silently desyncs from the registry's routing. The
+   * correspondence is what makes the bound meaningful — one group is exactly one
+   * `ToolSource`, so the thing bounded is the thing that owns the connection.
+   *
+   * Calls to different sources still go out together; only depth against any one
+   * source is capped. Results are written by index, so `buildToolResults`, which
+   * pairs positionally, is unaffected.
+   *
+   * In-process sources are bounded too. Every `nb__*` tool shares the `nb` key,
+   * so the cap covers 6 concurrent `nb__*` calls of any kind.
+   */
+  private async executeToolCallsBounded(
+    toolCalls: LanguageModelV4ToolCall[],
+    ctx: ToolExecContext,
+  ): Promise<ToolExecResult[]> {
+    const results = new Array<ToolExecResult>(toolCalls.length);
+    const bySource = new Map<string, number[]>();
+    for (let i = 0; i < toolCalls.length; i++) {
+      // Passing the raw wire name: `splitInnerToolName` documents its input as
+      // already stripped of any `ws_<id>-` prefix, which holds here because that
+      // form is rejected at the door before a call reaches the engine.
+      const { sourcePrefix } = splitInnerToolName(
+        (toolCalls[i] as LanguageModelV4ToolCall).toolName,
+      );
+      const group = bySource.get(sourcePrefix);
+      if (group) group.push(i);
+      else bySource.set(sourcePrefix, [i]);
+    }
+
+    await Promise.all(
+      [...bySource.values()].map((indices) =>
+        mapWithConcurrency(
+          indices,
+          MAX_PARALLEL_TOOL_CALLS_PER_SOURCE_PER_RUN,
+          async (callIndex) => {
+            // `executeToolCall` already contains its own failures (it returns an
+            // error result rather than throwing for tool-level problems), so no
+            // per-item try/catch is needed to keep siblings running.
+            results[callIndex] = await this.executeToolCall(
+              toolCalls[callIndex] as LanguageModelV4ToolCall,
+              ctx,
+            );
+          },
+        ),
+      ),
+    );
+
+    return results;
+  }
+
+  /**
+   * Record a held call: `tool.start` and `tool.done` like any call, so replay
+   * keeps it beside its re-issue, but marked `held` and carrying no UI binding
+   * (nothing ran, so there is no result to render). It skips everything that
+   * reads a call's outcome: execution, `afterToolCall`, the supervisor, and the
+   * promoted-tool LRU.
+   */
+  private finishHeldCall(
+    toolCall: LanguageModelV4ToolCall,
+    gatedCall: ToolCall,
+    result: ToolResult,
+    parsedInput: Record<string, unknown>,
+    ctx: ToolExecContext,
+  ): ToolExecResult {
+    this.events.emit({
+      type: "tool.start",
+      data: { runId: ctx.runId, name: gatedCall.name, id: gatedCall.id, input: parsedInput },
+    });
+    const outputText = extractTextForModel(result.content);
+    this.events.emit({
+      type: "tool.done",
+      data: buildToolDoneData({
+        runId: ctx.runId,
+        name: gatedCall.name,
+        id: gatedCall.id,
+        finalResult: result,
+        ms: 0,
+        resourceUri: undefined,
+        outputText,
+        bounded: false,
+        modelOutput: outputText,
+        resourceLinks: [],
+        verdict: { type: "pass" },
+        held: true,
+      }),
+    });
+    return { toolCall, gatedCall, result, ms: 0, modelOutput: outputText, held: true };
+  }
+
+  /**
+   * A `beforeToolCall` hook renamed the call after the hold had checked the
+   * name the model sent. The renamed call runs, and its tool's guidance comes
+   * after it; record each bound skill that missed the hold.
+   */
+  private recordRenamedPastHold(name: string, ctx: ToolExecContext): void {
+    const readOnly = ctx.allToolSchemaMap.get(name)?.annotations?.readOnlyHint === true;
+    for (const skill of this.boundSkills(ctx.skills, name, readOnly)) {
+      if (ctx.skills.queued.has(skill.name)) continue;
+      this.emitNotDelivered(ctx.runId, name, skill.name, "renamed_unheld");
+    }
+  }
+
+  /**
+   * Check a model call, then put it through the beforeToolCall gate. The call
+   * is checked first (visibility, coerce, validate) so a person is asked to
+   * approve only a call the engine would dispatch, and approves the coerced
+   * input that is sent. An invalid call skips the gate and carries its error
+   * result. Whatever the hook returns is checked the same way again: a hook
+   * may rewrite the call, and the engine dispatches only what it checked.
+   * A valid call that repeats the exact call a tool was tripped on is refused
+   * here too, before the gate (see `RunSupervisor.repeatRefusal`); every other
+   * call to a tripped tool proceeds. `refused` is a call that ends here,
+   * before tool.start.
+   */
+  private async checkAndGate(
+    toolCall: LanguageModelV4ToolCall,
+    parsedInput: Record<string, unknown>,
+    ctx: ToolExecContext,
+  ): Promise<
+    | { refused: ToolExecResult }
+    | { gatedCall: ToolCall; result: ToolResult; held: true }
+    | { gatedCall: ToolCall; result?: ToolResult; held?: undefined }
+  > {
+    const offered: ToolCall = {
+      id: toolCall.toolCallId,
+      name: toolCall.toolName,
+      input: parsedInput,
+    };
+    if (!isModelVisible({ meta: ctx.toolMeta.get(offered.name) })) {
+      return { refused: notAvailableToAgent(toolCall, offered) };
+    }
+    const checked = coerceAndValidateToolInput(parsedInput, toolSchemaFor(ctx, offered.name));
+    const validated: ToolCall = { ...offered, input: checked.input };
+    if (checked.errorResult) return { gatedCall: validated, result: checked.errorResult };
+    const repeat = repeatOfTrip(toolCall, validated, ctx);
+    if (repeat) return { refused: repeat };
+    // Ahead of the hook, so no person approves a call that is then held.
+    const held = await this.holdForGuidance(validated, ctx);
+    if (held) return { gatedCall: validated, result: held, held: true };
+    const beforeToolCall = ctx.config.hooks?.beforeToolCall;
+    if (!beforeToolCall) return { gatedCall: validated };
+
+    const hooked = await beforeToolCall(validated);
+    if (hooked === null) {
+      return {
+        refused: {
+          toolCall,
+          gatedCall: validated,
+          result: {
+            content: textContent("Tool call was denied by policy."),
+            isError: true,
+          } as ToolResult,
+          ms: 0,
+        },
+      };
+    }
+    if (!isModelVisible({ meta: ctx.toolMeta.get(hooked.name) })) {
+      return { refused: notAvailableToAgent(toolCall, hooked) };
+    }
+    const rechecked = coerceAndValidateToolInput(hooked.input, toolSchemaFor(ctx, hooked.name));
+    const gatedCall: ToolCall = { ...hooked, input: rechecked.input };
+    if (rechecked.errorResult) return { gatedCall, result: rechecked.errorResult };
+    if (gatedCall.name !== validated.name) this.recordRenamedPastHold(gatedCall.name, ctx);
+    const hookedRepeat = repeatOfTrip(toolCall, gatedCall, ctx);
+    if (hookedRepeat) return { refused: hookedRepeat };
+    return { gatedCall };
+  }
+
+  /**
+   * Run one tool call end-to-end: check and gate (checkAndGate) → execute →
+   * bound → afterToolCall → supervisor → emit. Returns the record the loop
+   * needs to build history and telemetry. Called concurrently (up to the
+   * per-source cap) from the iteration's bounded dispatch above.
+   */
+  private async executeToolCall(
+    toolCall: LanguageModelV4ToolCall,
+    ctx: ToolExecContext,
+  ): Promise<ToolExecResult> {
+    let parsedInput: Record<string, unknown>;
+    try {
+      parsedInput = parseToolCallInput(toolCall.input);
+    } catch {
+      // The model streamed a tool-call `input` that isn't valid JSON (e.g. a
+      // stray comma). Surface it as an invalid-input tool result — the same
+      // shape a schema-validation failure produces — so the model can correct
+      // on the next iteration, rather than throwing and aborting the whole run.
+      return {
+        toolCall,
+        gatedCall: { id: toolCall.toolCallId, name: toolCall.toolName, input: {} },
+        result: {
+          content: textContent("Invalid tool input: arguments were not valid JSON."),
+          isError: true,
+        } as ToolResult,
+        ms: 0,
+      };
+    }
+
+    const checked = await this.checkAndGate(toolCall, parsedInput, ctx);
+    if ("refused" in checked) return checked.refused;
+    if (checked.held)
+      return this.finishHeldCall(toolCall, checked.gatedCall, checked.result, parsedInput, ctx);
+    const { gatedCall } = checked;
+    let result = checked.result;
+
+    // Extract UI resourceUri from the tool's `_meta` if present
+    const meta = ctx.toolMeta.get(gatedCall.name);
+    const uiMeta = meta?.ui as Record<string, unknown> | undefined;
+    const resourceUri = typeof uiMeta?.resourceUri === "string" ? uiMeta.resourceUri : undefined;
+
+    // tool.start fires with the model's raw input on purpose: audit and
+    // telemetry should see what the model emitted, so we can observe when
+    // models string-encode nested objects (the misbehavior
+    // coerceInputForSchema recovers from). Do not emit the coerced input here.
+    this.events.emit({
+      type: "tool.start",
+      data: {
+        runId: ctx.runId,
+        name: gatedCall.name,
+        id: gatedCall.id,
+        resourceUri,
+        input: parsedInput,
+      },
+    });
+
+    this.injectConnectorSkillOverlays(ctx.skills, gatedCall.name);
+
+    const start = performance.now();
+
+    if (!result) {
+      try {
+        // Forward the run's AbortSignal so task-augmented MCP tools
+        // propagate cancellation via tasks/cancel and inline tools
+        // abort their in-flight RPC. Identity flows through
+        // AsyncLocalStorage (`runWithRequestContext`); no principal
+        // argument threads through the call.
+        result = await this.tools.execute(gatedCall, ctx.config.signal);
+      } catch (err) {
+        result = {
+          content: textContent(err instanceof Error ? err.message : String(err)),
+          isError: true,
+        };
+      }
+    }
+
+    // LRU refresh: a promoted tool that's actively being called
+    // moves to the back of the eviction queue. Initial tools aren't
+    // in the map and are exempt from eviction either way.
+    if (ctx.promotedLastUsed.has(gatedCall.name)) {
+      ctx.promotedLastUsed.set(gatedCall.name, ctx.bumpUseCounter());
+    }
+
+    // Guard: reject oversized tool results before event emission or history accumulation
+    result = enforceMaxToolResultSize(result, ctx.config.maxToolResultSize);
+
+    const ms = performance.now() - start;
+
+    const hookedResult = ctx.config.hooks?.afterToolCall
+      ? await ctx.config.hooks.afterToolCall(gatedCall, result)
+      : result;
+
+    // Supervisor sees the post-hook, post-A.3-normalization result.
+    // On a trip, the replacement directive flows downstream in place
+    // of the original tool result. While it stays tripped the tool is
+    // withheld from `modelTools` on subsequent iterations (see
+    // buildIterationTools), so the model is not offered it again. Withheld is
+    // not refused: a call naming the tool still runs, and that call is how a
+    // trip clears (see the supervisor's file header). checkAndGate refuses
+    // only the exact call a success trip was made of.
+    const verdict = ctx.supervisor.observe(gatedCall, hookedResult);
+    const finalResult = verdict.type === "synth" ? verdict.replacement : hookedResult;
+
+    // Extract text output for persistence. The full structured result
+    // is only attached when there's a resourceUri (inline UI), but the
+    // text output is always needed for conversation history reconstruction.
+    const outputText = extractTextForModel(finalResult.content);
+
+    // Bound the text the MODEL sees. `outputText` (full) is persisted
+    // for the UI and the record; `modelOutput` (bounded) is what enters
+    // the prompt — both on this live turn AND on every replay. Computing
+    // it once here and persisting it keeps the live view and the
+    // replayed view byte-identical. See boundToolResultForModel.
+    const modelOutput = boundToolResultForModel(outputText, {
+      hasUiResource: !!resourceUri,
+    });
+    const bounded = modelOutput !== outputText;
+    this.emitToolResultBoundedProgress(
+      bounded,
+      ctx.runId,
+      gatedCall.id,
+      resourceUri,
+      outputText,
+      modelOutput,
+    );
+
+    // Per-call resource_link blocks (MCP 2025-11-25). Distinct from the
+    // static `resourceUri` tool annotation used for inline UI binding —
+    // resource_link points at a file/resource the client should fetch.
+    const resourceLinks = extractResourceLinks(finalResult.content);
+
+    this.recordSkillActivation(ctx, gatedCall, finalResult);
+    this.recordSkillSuppression(finalResult, ctx.runId);
+
+    this.events.emit({
+      type: "tool.done",
+      data: buildToolDoneData({
+        runId: ctx.runId,
+        name: gatedCall.name,
+        id: gatedCall.id,
+        finalResult,
+        ms,
+        resourceUri,
+        outputText,
+        bounded,
+        modelOutput,
+        resourceLinks,
+        verdict,
+      }),
+    });
+
+    return {
+      toolCall,
+      gatedCall,
+      result: finalResult,
+      ms,
+      resourceUri,
+      resourceLinks,
+      modelOutput,
+    };
+  }
+}

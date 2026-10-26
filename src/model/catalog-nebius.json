@@ -1,0 +1,161 @@
+{
+  "nebius": {
+    "name": "Nebius Token Factory",
+    "models": {
+      "openai/gpt-oss-120b": {
+        "id": "openai/gpt-oss-120b",
+        "name": "GPT-OSS 120B",
+        "family": "gpt-oss",
+        "cost": {
+          "input": 0.15,
+          "output": 0.6
+        },
+        "limits": {
+          "context": 131072,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "Qwen/Qwen3-235B-A22B-Instruct-2507": {
+        "id": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "name": "Qwen3 235B A22B Instruct",
+        "family": "qwen",
+        "cost": {
+          "input": 0.2,
+          "output": 0.6
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "Qwen/Qwen3.5-397B-A17B": {
+        "id": "Qwen/Qwen3.5-397B-A17B",
+        "name": "Qwen3.5 397B A17B",
+        "family": "qwen",
+        "cost": {
+          "input": 0.6,
+          "output": 3.6
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "name": "DeepSeek V4 Flash",
+        "family": "deepseek",
+        "cost": {
+          "input": 0.14,
+          "output": 0.28
+        },
+        "limits": {
+          "context": 1024000,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "nvidia/Nemotron-3-Ultra-550b-a55b": {
+        "id": "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "name": "Nemotron 3 Ultra",
+        "family": "nvidia",
+        "cost": {
+          "input": 1,
+          "output": 3
+        },
+        "limits": {
+          "context": 1048576,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "moonshotai/Kimi-K2.6": {
+        "id": "moonshotai/Kimi-K2.6",
+        "name": "Kimi K2.6",
+        "family": "kimi",
+        "cost": {
+          "input": 0.95,
+          "output": 4
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      },
+      "zai-org/GLM-5.3": {
+        "id": "zai-org/GLM-5.3",
+        "name": "GLM 5.3",
+        "family": "glm",
+        "cost": {
+          "input": 1.4,
+          "output": 4.4
+        },
+        "limits": {
+          "context": 1024000,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        }
+      }
+    }
+  }
+}
