@@ -11,9 +11,7 @@
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test --no-env-file",
     "lint": "biome lint src test",
-    "format": "biome format --write src test",
-    "sync": "bun scripts/sync.ts",
-    "sync:check": "bun scripts/sync.ts --check"
+    "format": "biome format --write src test"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "2.0.2",
