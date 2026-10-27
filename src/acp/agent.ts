@@ -22,7 +22,13 @@ import type { EngineConfig, EngineEvent, EventSink } from "../engine/types.ts";
 import type { ModelResolver } from "../model/resolve.ts";
 import { log } from "../observability/log.ts";
 import { addUsage, type TokenUsage } from "../usage/types.ts";
-import { connectMcpToolRouter, type HttpMcpServer, type McpToolRouter } from "./mcp-tool-router.ts";
+import { acpMcpTransport } from "./acp-mcp-transport.ts";
+import {
+  connectMcpToolRouter,
+  httpMcpServer,
+  type McpToolRouter,
+  type ReachableMcpServer,
+} from "./mcp-tool-router.ts";
 import {
   decodeMessages,
   type ModelCallUsage,
@@ -36,7 +42,7 @@ import {
   USAGE_META_KEY,
 } from "./session-options.ts";
 
-export const AGENT_VERSION = "0.2.0";
+export const AGENT_VERSION = "0.3.0";
 
 interface AgentSession {
   settings: SessionSettings;
@@ -62,7 +68,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       agentCapabilities: {
         loadSession: false,
         promptCapabilities: { image: true, embeddedContext: true },
-        mcpCapabilities: { http: true },
+        mcpCapabilities: { http: true, acp: true },
       },
       agentInfo: { name: "nimblebrain-agent", version: AGENT_VERSION },
     }))
@@ -70,7 +76,9 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       const sent = (ctx.params._meta?.[SESSION_META_KEY] ?? {}) as SessionOptions;
       const { history, ...overrides } = sent;
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
-      const router = await connectMcpToolRouter(ctx.params.mcpServers.map(httpServer));
+      const router = await connectMcpToolRouter(
+        ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
+      );
       const sessionId = crypto.randomUUID();
       sessions.set(sessionId, {
         settings,
@@ -198,13 +206,16 @@ function acpUsage(usage: TokenUsage): acp.Usage {
   };
 }
 
-function httpServer(server: acp.McpServer): HttpMcpServer {
-  if ("type" in server && server.type === "http") {
-    return { name: server.name, url: server.url, headers: server.headers };
+/** How to reach one MCP server the client named: over HTTP, or over this connection (`acp`). */
+function reachable(server: acp.McpServer, client: acp.AgentContext): ReachableMcpServer {
+  if ("type" in server && server.type === "http") return httpMcpServer(server);
+  if ("type" in server && server.type === "acp") {
+    const { serverId } = server;
+    return { name: server.name, transport: () => acpMcpTransport(client, serverId) };
   }
   throw acp.RequestError.invalidParams(
     undefined,
-    `MCP server ${server.name}: only http is supported`,
+    `MCP server ${server.name}: only http and acp are supported`,
   );
 }
 

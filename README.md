@@ -31,8 +31,11 @@ Point an ACP client at that command. A session runs on these defaults:
 
 ## What nimblebrain-agent does
 
-- **Tools:** whatever the HTTP MCP servers named at `session/new` serve, and nothing else. nimblebrain-agent
-  advertises no filesystem or terminal use, and has no built-in tools.
+- **Tools:** whatever the MCP servers named at `session/new` serve, and nothing else. A server is
+  reached over HTTP, or over the ACP connection itself when the client declares it with the `acp`
+  transport (`mcpCapabilities.acp`, the MCP-over-ACP proposal): each MCP message then travels as
+  `mcp/message` on the connection, so the client opens nothing for the agent to call.
+  nimblebrain-agent advertises no filesystem or terminal use, and has no built-in tools.
 - **Context:** each model call's history is windowed to the call's budget, and a turn that
   outgrows it folds older history into a summary, written by the session's model unless the
   session names another or turns the fold off (`compaction`). The summary's usage is part of the

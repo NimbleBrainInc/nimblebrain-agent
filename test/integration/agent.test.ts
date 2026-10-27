@@ -16,6 +16,7 @@ import {
   USAGE_META_KEY,
 } from "../../src/acp/session-options.ts";
 import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
+import { type AcpStubMcp, acpStubMcp } from "../helpers/acp-stub-mcp.ts";
 import { type StubMcp, startStubMcp } from "../helpers/stub-mcp.ts";
 
 // nimblebrain-agent as any ACP client sees it: a session, tools from the MCP servers the
@@ -103,22 +104,29 @@ async function session(
   model: LanguageModelV4 | ((id: string) => LanguageModelV4),
   meta?: Record<string, unknown>,
   onUpdate?: (u: acp.SessionUpdate) => void,
+  overAcp?: AcpStubMcp,
 ) {
   const resolveModel = typeof model === "function" ? model : () => model;
-  mcp ??= startStubMcp((input) => `order ${input.orderId} shipped`);
+  if (!overAcp) mcp ??= startStubMcp((input) => `order ${input.orderId} shipped`);
   const updates: acp.SessionUpdate[] = [];
-  const connection = acp
+  const app = acp
     .client({ name: "test" })
     .onNotification(acp.methods.client.session.update, (ctx) => {
       updates.push(ctx.params.update);
       onUpdate?.(ctx.params.update);
-    })
-    .connect(createAgent({ resolveModel, defaults: DEFAULTS }));
+    });
+  const connection = (overAcp ? overAcp.serve(app) : app).connect(
+    createAgent({ resolveModel, defaults: DEFAULTS }),
+  );
   const agent = connection.agent;
-  await agent.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION });
+  const init = await agent.request(acp.methods.agent.initialize, {
+    protocolVersion: acp.PROTOCOL_VERSION,
+  });
   const { sessionId } = await agent.request(acp.methods.agent.session.new, {
     cwd: "/",
-    mcpServers: [{ type: "http", name: "stub", url: mcp.url, headers: [] }],
+    mcpServers: overAcp
+      ? [overAcp.server]
+      : [{ type: "http", name: "stub", url: mcp?.url ?? "", headers: [] }],
     ...(meta ? { _meta: meta } : {}),
   });
   const prompt = (text: string) =>
@@ -126,7 +134,7 @@ async function session(
       sessionId,
       prompt: [{ type: "text", text }],
     });
-  return { agent, sessionId, prompt, updates, close: () => connection.close() };
+  return { agent, sessionId, prompt, updates, init, close: () => connection.close() };
 }
 
 const text = (updates: acp.SessionUpdate[]) =>
@@ -380,5 +388,63 @@ describe("the agent's cancellation", () => {
     const response = await s.prompt("go");
     expect(response.stopReason).toBe("cancelled");
     s.close();
+  });
+});
+
+describe("the agent with tools on the ACP connection", () => {
+  test("advertises acp MCP servers and calls a tool on one over the connection", async () => {
+    const { model } = recording([
+      { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }] },
+      { text: "Order 8812 shipped." },
+    ]);
+    const overAcp = acpStubMcp((input) => `order ${input.orderId} shipped`);
+    const s = await session(model, undefined, undefined, overAcp);
+    expect(s.init.agentCapabilities?.mcpCapabilities).toMatchObject({ http: true, acp: true });
+
+    const response = await s.prompt("Where is order 8812?");
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(overAcp.calls).toEqual([{ orderId: "8812" }]);
+    expect(text(s.updates).trim()).toBe("Order 8812 shipped.");
+    s.close();
+  });
+
+  test("a cancel mid-tool ends the turn as cancelled", async () => {
+    const { model } = recording([
+      { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
+      { text: "never" },
+    ]);
+    const overAcp = acpStubMcp(() => "late");
+    let cancel: (() => void) | undefined;
+    const s = await session(
+      model,
+      undefined,
+      (u) => {
+        if (u.sessionUpdate === "tool_call") cancel?.();
+      },
+      overAcp,
+    );
+    cancel = () =>
+      void s.agent.notify(acp.methods.agent.session.cancel, { sessionId: s.sessionId });
+    const response = await s.prompt("go");
+    expect(response.stopReason).toBe("cancelled");
+    s.close();
+  });
+
+  test("refuses an MCP server on a transport it does not take", async () => {
+    const { model } = recording([{ text: "ok" }]);
+    const connection = acp
+      .client({ name: "test" })
+      .connect(createAgent({ resolveModel: () => model, defaults: DEFAULTS }));
+    await connection.agent.request(acp.methods.agent.initialize, {
+      protocolVersion: acp.PROTOCOL_VERSION,
+    });
+    await expect(
+      connection.agent.request(acp.methods.agent.session.new, {
+        cwd: "/",
+        mcpServers: [{ type: "sse", name: "old", url: "http://127.0.0.1:1/sse", headers: [] }],
+      }),
+    ).rejects.toThrow(/only http and acp are supported/);
+    connection.close();
   });
 });
