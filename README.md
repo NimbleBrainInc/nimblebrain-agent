@@ -34,8 +34,9 @@ Point an ACP client at that command. A session runs on these defaults:
 - **Tools:** whatever the HTTP MCP servers named at `session/new` serve, and nothing else. nimblebrain-agent
   advertises no filesystem or terminal use, and has no built-in tools.
 - **Context:** each model call's history is windowed to the call's budget, and a turn that
-  outgrows it folds older history into a summary written by the session's model. The summary's
-  usage is part of the turn's usage.
+  outgrows it folds older history into a summary, written by the session's model unless the
+  session names another or turns the fold off (`compaction`). The summary's usage is part of the
+  turn's usage.
 - **Streaming:** message text as `agent_message_chunk`, reasoning as `agent_thought_chunk`, and each
   tool call as `tool_call` / `tool_call_update`.
 - **Cancellation:** `session/cancel` stops the turn, including a tool call in flight; the turn
@@ -56,7 +57,8 @@ is optional; what is left out comes from the defaults above.
     "maxIterations": 25,
     "maxInputTokens": 200000,
     "maxOutputTokens": 8192,
-    "thinking": { "mode": "effort", "effort": "medium", "source": "config" }
+    "thinking": { "mode": "effort", "effort": "medium", "source": "config" },
+    "compaction": { "model": "anthropic:claude-haiku-4-5" }  // or false: never fold
   }
 }
 ```
@@ -65,8 +67,14 @@ is optional; what is left out comes from the defaults above.
 part's bytes written as `{ "__nb_agent_bytes": "<base64>" }`. The turn's own message is the
 `session/prompt` content.
 
-A `session/prompt` response carries nimblebrain-agent's own stop reason in `_meta["nimblebrain-agent/stopReason"]`
-(for example `max_input_tokens`), finer than ACP's `stopReason`.
+A `session/prompt` response carries in `_meta`:
+
+- `"nimblebrain-agent/stopReason"`: nimblebrain-agent's own stop reason (for example
+  `max_input_tokens`), finer than ACP's `stopReason`.
+- `"nimblebrain-agent/usage"`: every model call of the turn in the order it finished, each as
+  `{ model, purpose: "turn" | "summary", usage }`, and their `total`. `usage` is NimbleBrain's
+  `TokenUsage`, which keeps what ACP's `usage` drops: the 1-hour share of cache writes, and the
+  per-call split that tiered prices are computed from.
 
 ## Embedding
 

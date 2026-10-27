@@ -13,6 +13,10 @@ bun run sync:check <nimblebrain checkout>
 
 Every `bun` in the test path passes `--no-env-file`, so a developer's real keys never reach a test.
 
+CI (`.github/workflows/ci.yml`) runs the same checks, and `sync:check` against NimbleBrain's `main`
+on every change and daily. A red sync job means NimbleBrain changed a mirrored file: run
+`bun run sync <checkout>` and land the copy here.
+
 ## Two kinds of code
 
 - **Mirrored from NimbleBrain** (every path in `mirror.txt`): the engine (`src/engine/`), the model

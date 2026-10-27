@@ -5,8 +5,9 @@
  * The same two mechanisms NimbleBrain's native engine runs, wired the same
  * way: windowing on every model call (`transformContext`, with the provider's
  * reasoning replay policy), and a mid-turn fold that summarizes older history
- * when the turn outgrows its budget (`rewriteHistory`). The summary is written
- * by the session's own model; its usage is added to the turn's.
+ * when the turn outgrows its budget (`rewriteHistory`). The fold runs only when
+ * the session allows it, and its summary is written by the session's summarizer
+ * (`summarizer`), whose usage is reported with the turn's.
  */
 
 import type { LanguageModelV4 } from "@ai-sdk/provider";
@@ -20,17 +21,21 @@ import type { TokenUsage } from "../usage/types.ts";
 
 export interface TurnContext {
   model: string;
-  languageModel: LanguageModelV4;
   system: string;
   tools: ToolSchema[];
   maxInputTokens: number;
   maxOutputTokens: number;
-  /** Told the usage of each summary a fold writes. */
-  onSummaryUsage(usage: TokenUsage): void;
+  /** Who writes a fold's summary; absent, the turn never folds. */
+  summarizer?: {
+    model: string;
+    languageModel: LanguageModelV4;
+    /** Told the usage of each summary it writes. */
+    onUsage(usage: TokenUsage): void;
+  };
 }
 
 /** The per-call message budget: the model's window, less what the call spends elsewhere. */
-export function messageBudget(turn: Omit<TurnContext, "languageModel" | "onSummaryUsage">): number {
+export function messageBudget(turn: Omit<TurnContext, "summarizer">): number {
   return resolveMessageBudget({
     model: turn.model,
     configMaxInputTokens: turn.maxInputTokens,
@@ -43,6 +48,7 @@ export function messageBudget(turn: Omit<TurnContext, "languageModel" | "onSumma
 export function contextHooks(turn: TurnContext): EngineHooks {
   const budget = messageBudget(turn);
   const provider = getProviderFromModel(turn.model);
+  const { summarizer } = turn;
   return {
     transformContext: (history, opts) => {
       // A provider that rejected the last call for its size gets a halved budget per attempt.
@@ -50,14 +56,18 @@ export function contextHooks(turn: TurnContext): EngineHooks {
       const callBudget = attempt > 0 ? Math.floor(budget / (1 << attempt)) : budget;
       return windowMessages(applyReasoningReplayPolicy(history, provider), callBudget);
     },
-    rewriteHistory: buildMidTurnCompaction({
-      budget,
-      summarize: (folded, signal) =>
-        summarizeMessages(turn.languageModel, folded, {
-          summarizerContextTokens: getModelByString(turn.model)?.limits.context,
-          onUsage: (usage) => turn.onSummaryUsage(usage),
-          ...(signal ? { signal } : {}),
-        }),
-    }),
+    ...(summarizer
+      ? {
+          rewriteHistory: buildMidTurnCompaction({
+            budget,
+            summarize: (folded, signal) =>
+              summarizeMessages(summarizer.languageModel, folded, {
+                summarizerContextTokens: getModelByString(summarizer.model)?.limits.context,
+                onUsage: (usage) => summarizer.onUsage(usage),
+                ...(signal ? { signal } : {}),
+              }),
+          }),
+        }
+      : {}),
   };
 }

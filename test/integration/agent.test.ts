@@ -1,12 +1,19 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import type { LanguageModelV4, LanguageModelV4Prompt } from "@ai-sdk/provider";
+import type {
+  LanguageModelV4,
+  LanguageModelV4Prompt,
+  LanguageModelV4StreamPart,
+  LanguageModelV4Usage,
+} from "@ai-sdk/provider";
 import { createAgent } from "../../src/acp/agent.ts";
 import {
   encodeMessages,
   SESSION_META_KEY,
   type SessionSettings,
   STOP_REASON_META_KEY,
+  type TurnUsage,
+  USAGE_META_KEY,
 } from "../../src/acp/session-options.ts";
 import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
 import { type StubMcp, startStubMcp } from "../helpers/stub-mcp.ts";
@@ -28,30 +35,76 @@ afterEach(async () => {
   mcp = undefined;
 });
 
-/** A model that records every prompt it is sent, answering from a script. */
-function recording(script: EchoModelResponse[]): {
+/**
+ * A model that records every prompt it is sent, answering from a script. When `usage` is
+ * given, each call reports the next entry as the provider's usage, in call order.
+ */
+function recording(
+  script: EchoModelResponse[],
+  usage: LanguageModelV4Usage[] = [],
+): {
   model: LanguageModelV4;
   prompts: LanguageModelV4Prompt[];
 } {
   const prompts: LanguageModelV4Prompt[] = [];
   const echo = createEchoModel({ responses: script });
+  const reported = [...usage];
   return {
     prompts,
     model: {
       ...echo,
-      doStream(options) {
+      async doStream(options) {
         prompts.push(options.prompt);
-        return echo.doStream(options);
+        const result = await echo.doStream(options);
+        const next = reported.shift();
+        if (!next) return result;
+        const stream = result.stream.pipeThrough(
+          new TransformStream<LanguageModelV4StreamPart, LanguageModelV4StreamPart>({
+            transform(part, controller) {
+              controller.enqueue(part.type === "finish" ? { ...part, usage: next } : part);
+            },
+          }),
+        );
+        return { ...result, stream };
+      },
+      async doGenerate(options) {
+        prompts.push(options.prompt);
+        const result = await echo.doGenerate(options);
+        const next = reported.shift();
+        return next ? { ...result, usage: next } : result;
       },
     },
   };
 }
 
+/** A provider usage report, with Anthropic's cache-write TTL split under `raw` when given. */
+function providerUsage(u: {
+  noCache: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheWrite1h?: number;
+  output: number;
+}): LanguageModelV4Usage {
+  return {
+    inputTokens: {
+      total: u.noCache + u.cacheRead + u.cacheWrite,
+      noCache: u.noCache,
+      cacheRead: u.cacheRead,
+      cacheWrite: u.cacheWrite,
+    },
+    outputTokens: { total: u.output, text: u.output, reasoning: undefined },
+    ...(u.cacheWrite1h != null
+      ? { raw: { cache_creation: { ephemeral_1h_input_tokens: u.cacheWrite1h } } }
+      : {}),
+  };
+}
+
 async function session(
-  model: LanguageModelV4,
+  model: LanguageModelV4 | ((id: string) => LanguageModelV4),
   meta?: Record<string, unknown>,
   onUpdate?: (u: acp.SessionUpdate) => void,
 ) {
+  const resolveModel = typeof model === "function" ? model : () => model;
   mcp ??= startStubMcp((input) => `order ${input.orderId} shipped`);
   const updates: acp.SessionUpdate[] = [];
   const connection = acp
@@ -60,7 +113,7 @@ async function session(
       updates.push(ctx.params.update);
       onUpdate?.(ctx.params.update);
     })
-    .connect(createAgent({ resolveModel: () => model, defaults: DEFAULTS }));
+    .connect(createAgent({ resolveModel, defaults: DEFAULTS }));
   const agent = connection.agent;
   await agent.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION });
   const { sessionId } = await agent.request(acp.methods.agent.session.new, {
@@ -132,6 +185,181 @@ describe("the agent with a host's session options", () => {
     const [system, ...rest] = prompts[0] ?? [];
     expect(system).toMatchObject({ role: "system", content: "host system prompt" });
     expect(JSON.stringify(rest)).toContain("earlier answer");
+    s.close();
+  });
+});
+
+/** A long history: enough earlier exchanges to outgrow a small input budget. */
+function longHistory(): string {
+  const filler = "lorem ipsum dolor sit amet ".repeat(300);
+  return encodeMessages(
+    Array.from({ length: 12 }, (_, i) => [
+      { role: "user" as const, content: [{ type: "text" as const, text: `q${i} ${filler}` }] },
+      { role: "assistant" as const, content: [{ type: "text" as const, text: `a${i} ${filler}` }] },
+    ]).flat(),
+  );
+}
+
+const OVER_BUDGET = { maxInputTokens: 20_000, maxOutputTokens: 1_000 };
+
+describe("the agent's usage report", () => {
+  test("reports every model call of the turn, its cache-write TTL split, and their total", async () => {
+    const { model } = recording(
+      [
+        {
+          toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }],
+        },
+        { text: "Order 8812 shipped." },
+      ],
+      [
+        providerUsage({
+          noCache: 200,
+          cacheRead: 300,
+          cacheWrite: 500,
+          cacheWrite1h: 400,
+          output: 50,
+        }),
+        providerUsage({
+          noCache: 100,
+          cacheRead: 800,
+          cacheWrite: 120,
+          cacheWrite1h: 0,
+          output: 30,
+        }),
+      ],
+    );
+    const s = await session(model);
+    const response = await s.prompt("Where is order 8812?");
+    const usage = response._meta?.[USAGE_META_KEY] as TurnUsage;
+
+    expect(usage.calls).toEqual([
+      {
+        model: DEFAULTS.model,
+        purpose: "turn",
+        usage: {
+          inputTokens: 1_000,
+          outputTokens: 50,
+          cacheReadTokens: 300,
+          cacheWriteTokens: 500,
+          cacheWrite1hTokens: 400,
+          reasoningTokens: 0,
+        },
+      },
+      {
+        model: DEFAULTS.model,
+        purpose: "turn",
+        usage: {
+          inputTokens: 1_020,
+          outputTokens: 30,
+          cacheReadTokens: 800,
+          cacheWriteTokens: 120,
+          cacheWrite1hTokens: 0,
+          reasoningTokens: 0,
+        },
+      },
+    ]);
+    expect(usage.total).toEqual({
+      inputTokens: 2_020,
+      outputTokens: 80,
+      cacheReadTokens: 1_100,
+      cacheWriteTokens: 620,
+      cacheWrite1hTokens: 400,
+      reasoningTokens: 0,
+    });
+    expect(response.usage).toEqual({
+      inputTokens: 2_020,
+      outputTokens: 80,
+      totalTokens: 2_100,
+      cachedReadTokens: 1_100,
+      cachedWriteTokens: 620,
+    });
+    s.close();
+  });
+});
+
+describe("the agent's mid-turn fold", () => {
+  const toolTurn = (): EchoModelResponse[] => [
+    { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }] },
+    { text: "done" },
+  ];
+
+  test("is written by the session's compaction model and reported as a summary", async () => {
+    const main = recording(toolTurn(), [
+      providerUsage({
+        noCache: 4_000,
+        cacheRead: 0,
+        cacheWrite: 1_000,
+        cacheWrite1h: 1_000,
+        output: 20,
+      }),
+      providerUsage({
+        noCache: 3_000,
+        cacheRead: 1_000,
+        cacheWrite: 0,
+        cacheWrite1h: 0,
+        output: 10,
+      }),
+    ]);
+    const summarizer = recording(
+      [{ text: "summary of earlier exchanges" }],
+      [providerUsage({ noCache: 9_000, cacheRead: 0, cacheWrite: 0, output: 300 })],
+    );
+    const resolved: string[] = [];
+    const s = await session(
+      (id) => {
+        resolved.push(id);
+        return id === "anthropic:claude-haiku-4-5" ? summarizer.model : main.model;
+      },
+      {
+        [SESSION_META_KEY]: {
+          ...OVER_BUDGET,
+          history: longHistory(),
+          compaction: { model: "anthropic:claude-haiku-4-5" },
+        },
+      },
+    );
+    const response = await s.prompt("Where is order 8812?");
+    const usage = response._meta?.[USAGE_META_KEY] as TurnUsage;
+
+    expect(resolved).toContain("anthropic:claude-haiku-4-5");
+    expect(summarizer.prompts.length).toBeGreaterThan(0);
+    expect(summarizer.prompts.length).toBe(1);
+    expect(usage.calls.filter((c) => c.purpose === "summary")).toEqual([
+      {
+        model: "anthropic:claude-haiku-4-5",
+        purpose: "summary",
+        usage: {
+          inputTokens: 9_000,
+          outputTokens: 300,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          reasoningTokens: 0,
+        },
+      },
+    ]);
+    expect(usage.total).toEqual({
+      inputTokens: 18_000,
+      outputTokens: 330,
+      cacheReadTokens: 1_000,
+      cacheWriteTokens: 1_000,
+      cacheWrite1hTokens: 1_000,
+      reasoningTokens: 0,
+    });
+    expect(response.usage?.inputTokens).toBe(18_000);
+    s.close();
+  });
+
+  test("never runs when the session turns compaction off", async () => {
+    const main = recording(toolTurn());
+    const s = await session(main.model, {
+      [SESSION_META_KEY]: { ...OVER_BUDGET, history: longHistory(), compaction: false },
+    });
+    const response = await s.prompt("Where is order 8812?");
+    const usage = response._meta?.[USAGE_META_KEY] as TurnUsage;
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(usage.calls.every((c) => c.purpose === "turn")).toBe(true);
+    expect(main.prompts.length).toBe(2);
     s.close();
   });
 });
