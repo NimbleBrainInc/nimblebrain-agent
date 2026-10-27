@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import type { LanguageModelV4, LanguageModelV4Prompt } from "@ai-sdk/provider";
+import type {
+  LanguageModelV4,
+  LanguageModelV4Prompt,
+  LanguageModelV4StreamPart,
+  LanguageModelV4Usage,
+} from "@ai-sdk/provider";
 import { createAgent } from "../../src/acp/agent.ts";
 import {
   encodeMessages,
@@ -30,26 +35,67 @@ afterEach(async () => {
   mcp = undefined;
 });
 
-/** A model that records every prompt it is sent, answering from a script. */
-function recording(script: EchoModelResponse[]): {
+/**
+ * A model that records every prompt it is sent, answering from a script. When `usage` is
+ * given, each call reports the next entry as the provider's usage, in call order.
+ */
+function recording(
+  script: EchoModelResponse[],
+  usage: LanguageModelV4Usage[] = [],
+): {
   model: LanguageModelV4;
   prompts: LanguageModelV4Prompt[];
 } {
   const prompts: LanguageModelV4Prompt[] = [];
   const echo = createEchoModel({ responses: script });
+  const reported = [...usage];
   return {
     prompts,
     model: {
       ...echo,
-      doStream(options) {
+      async doStream(options) {
         prompts.push(options.prompt);
-        return echo.doStream(options);
+        const result = await echo.doStream(options);
+        const next = reported.shift();
+        if (!next) return result;
+        const stream = result.stream.pipeThrough(
+          new TransformStream<LanguageModelV4StreamPart, LanguageModelV4StreamPart>({
+            transform(part, controller) {
+              controller.enqueue(part.type === "finish" ? { ...part, usage: next } : part);
+            },
+          }),
+        );
+        return { ...result, stream };
       },
-      doGenerate(options) {
+      async doGenerate(options) {
         prompts.push(options.prompt);
-        return echo.doGenerate(options);
+        const result = await echo.doGenerate(options);
+        const next = reported.shift();
+        return next ? { ...result, usage: next } : result;
       },
     },
+  };
+}
+
+/** A provider usage report, with Anthropic's cache-write TTL split under `raw` when given. */
+function providerUsage(u: {
+  noCache: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheWrite1h?: number;
+  output: number;
+}): LanguageModelV4Usage {
+  return {
+    inputTokens: {
+      total: u.noCache + u.cacheRead + u.cacheWrite,
+      noCache: u.noCache,
+      cacheRead: u.cacheRead,
+      cacheWrite: u.cacheWrite,
+    },
+    outputTokens: { total: u.output, text: u.output, reasoning: undefined },
+    ...(u.cacheWrite1h != null
+      ? { raw: { cache_creation: { ephemeral_1h_input_tokens: u.cacheWrite1h } } }
+      : {}),
   };
 }
 
@@ -157,24 +203,76 @@ function longHistory(): string {
 const OVER_BUDGET = { maxInputTokens: 20_000, maxOutputTokens: 1_000 };
 
 describe("the agent's usage report", () => {
-  test("reports every model call of the turn and their total", async () => {
-    const { model } = recording([
-      { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }] },
-      { text: "Order 8812 shipped." },
-    ]);
+  test("reports every model call of the turn, its cache-write TTL split, and their total", async () => {
+    const { model } = recording(
+      [
+        {
+          toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }],
+        },
+        { text: "Order 8812 shipped." },
+      ],
+      [
+        providerUsage({
+          noCache: 200,
+          cacheRead: 300,
+          cacheWrite: 500,
+          cacheWrite1h: 400,
+          output: 50,
+        }),
+        providerUsage({
+          noCache: 100,
+          cacheRead: 800,
+          cacheWrite: 120,
+          cacheWrite1h: 0,
+          output: 30,
+        }),
+      ],
+    );
     const s = await session(model);
     const response = await s.prompt("Where is order 8812?");
     const usage = response._meta?.[USAGE_META_KEY] as TurnUsage;
 
-    expect(usage.calls.map((c) => [c.model, c.purpose])).toEqual([
-      [DEFAULTS.model, "turn"],
-      [DEFAULTS.model, "turn"],
+    expect(usage.calls).toEqual([
+      {
+        model: DEFAULTS.model,
+        purpose: "turn",
+        usage: {
+          inputTokens: 1_000,
+          outputTokens: 50,
+          cacheReadTokens: 300,
+          cacheWriteTokens: 500,
+          cacheWrite1hTokens: 400,
+          reasoningTokens: 0,
+        },
+      },
+      {
+        model: DEFAULTS.model,
+        purpose: "turn",
+        usage: {
+          inputTokens: 1_020,
+          outputTokens: 30,
+          cacheReadTokens: 800,
+          cacheWriteTokens: 120,
+          cacheWrite1hTokens: 0,
+          reasoningTokens: 0,
+        },
+      },
     ]);
-    const sum = (k: "inputTokens" | "outputTokens") =>
-      usage.calls.reduce((n, c) => n + c.usage[k], 0);
-    expect(usage.total.inputTokens).toBe(sum("inputTokens"));
-    expect(usage.total.outputTokens).toBe(sum("outputTokens"));
-    expect(response.usage?.inputTokens).toBe(usage.total.inputTokens);
+    expect(usage.total).toEqual({
+      inputTokens: 2_020,
+      outputTokens: 80,
+      cacheReadTokens: 1_100,
+      cacheWriteTokens: 620,
+      cacheWrite1hTokens: 400,
+      reasoningTokens: 0,
+    });
+    expect(response.usage).toEqual({
+      inputTokens: 2_020,
+      outputTokens: 80,
+      totalTokens: 2_100,
+      cachedReadTokens: 1_100,
+      cachedWriteTokens: 620,
+    });
     s.close();
   });
 });
@@ -186,8 +284,26 @@ describe("the agent's mid-turn fold", () => {
   ];
 
   test("is written by the session's compaction model and reported as a summary", async () => {
-    const main = recording(toolTurn());
-    const summarizer = recording([{ text: "summary of earlier exchanges" }]);
+    const main = recording(toolTurn(), [
+      providerUsage({
+        noCache: 4_000,
+        cacheRead: 0,
+        cacheWrite: 1_000,
+        cacheWrite1h: 1_000,
+        output: 20,
+      }),
+      providerUsage({
+        noCache: 3_000,
+        cacheRead: 1_000,
+        cacheWrite: 0,
+        cacheWrite1h: 0,
+        output: 10,
+      }),
+    ]);
+    const summarizer = recording(
+      [{ text: "summary of earlier exchanges" }],
+      [providerUsage({ noCache: 9_000, cacheRead: 0, cacheWrite: 0, output: 300 })],
+    );
     const resolved: string[] = [];
     const s = await session(
       (id) => {
@@ -207,9 +323,29 @@ describe("the agent's mid-turn fold", () => {
 
     expect(resolved).toContain("anthropic:claude-haiku-4-5");
     expect(summarizer.prompts.length).toBeGreaterThan(0);
-    expect(usage.calls.filter((c) => c.purpose === "summary").map((c) => c.model)).toEqual(
-      summarizer.prompts.map(() => "anthropic:claude-haiku-4-5"),
-    );
+    expect(summarizer.prompts.length).toBe(1);
+    expect(usage.calls.filter((c) => c.purpose === "summary")).toEqual([
+      {
+        model: "anthropic:claude-haiku-4-5",
+        purpose: "summary",
+        usage: {
+          inputTokens: 9_000,
+          outputTokens: 300,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          reasoningTokens: 0,
+        },
+      },
+    ]);
+    expect(usage.total).toEqual({
+      inputTokens: 18_000,
+      outputTokens: 330,
+      cacheReadTokens: 1_000,
+      cacheWriteTokens: 1_000,
+      cacheWrite1hTokens: 1_000,
+      reasoningTokens: 0,
+    });
+    expect(response.usage?.inputTokens).toBe(18_000);
     s.close();
   });
 
