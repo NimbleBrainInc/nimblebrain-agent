@@ -15,21 +15,49 @@
  *     model?: string,            // "provider:model"
  *     maxIterations?: number, maxInputTokens?: number, maxOutputTokens?: number,
  *     thinking?: ResolvedThinking,
+ *     compaction?: false | { model?: string },  // mid-turn fold: off, or its summarizer model
  *   } }
  *
  * A `session/prompt` response carries nimblebrain-agent's own stop reason under
- * {@link STOP_REASON_META_KEY}, finer than ACP's.
+ * {@link STOP_REASON_META_KEY}, finer than ACP's, and the turn's usage under
+ * {@link USAGE_META_KEY}: every model call it made, in order, and their total.
+ * ACP's own `usage` field holds the same total in ACP's coarser shape.
  */
 
 import type { ContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type { LanguageModelV4Message } from "@ai-sdk/provider";
 import type { ResolvedThinking, StopReason } from "../engine/types.ts";
+import type { TokenUsage } from "../usage/types.ts";
 
 /** On `session/new`: the client's options for the session. */
 export const SESSION_META_KEY = "nimblebrain-agent/session";
 
 /** On a `session/prompt` response: the engine's own stop reason. */
 export const STOP_REASON_META_KEY = "nimblebrain-agent/stopReason";
+
+/** On a `session/prompt` response: the turn's usage, per model call and in total. */
+export const USAGE_META_KEY = "nimblebrain-agent/usage";
+
+/** One model call of a turn: a loop iteration, or a summary written by a mid-turn fold. */
+export interface ModelCallUsage {
+  model: string;
+  purpose: "turn" | "summary";
+  usage: TokenUsage;
+}
+
+export interface TurnUsage {
+  /** Every model call of the turn, in the order they finished. */
+  calls: ModelCallUsage[];
+  /** The sum of `calls`. */
+  total: TokenUsage;
+}
+
+/**
+ * The mid-turn fold. `false` turns it off, so a turn that outgrows its budget
+ * is windowed but never summarized. An object turns it on, written by `model`
+ * (the session's model when absent).
+ */
+export type CompactionSettings = false | { model?: string };
 
 /** What a session runs with: the client's options over nimblebrain-agent's defaults. */
 export interface SessionSettings {
@@ -39,6 +67,7 @@ export interface SessionSettings {
   maxInputTokens: number;
   maxOutputTokens: number;
   thinking?: ResolvedThinking;
+  compaction?: CompactionSettings;
 }
 
 /** The options a client may send. Every field is optional. */

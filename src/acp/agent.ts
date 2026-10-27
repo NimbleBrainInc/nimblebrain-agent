@@ -15,8 +15,8 @@
  */
 
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import type { LanguageModelV4Message } from "@ai-sdk/provider";
-import { contextHooks } from "../context/hooks.ts";
+import type { LanguageModelV4, LanguageModelV4Message } from "@ai-sdk/provider";
+import { contextHooks, type TurnContext } from "../context/hooks.ts";
 import { AgentEngine } from "../engine/engine.ts";
 import type { EngineConfig, EngineEvent, EventSink } from "../engine/types.ts";
 import type { ModelResolver } from "../model/resolve.ts";
@@ -25,15 +25,18 @@ import { addUsage, type TokenUsage } from "../usage/types.ts";
 import { connectMcpToolRouter, type HttpMcpServer, type McpToolRouter } from "./mcp-tool-router.ts";
 import {
   decodeMessages,
+  type ModelCallUsage,
   promptToUserMessage,
   SESSION_META_KEY,
   type SessionOptions,
   type SessionSettings,
   STOP_REASON_META_KEY,
+  type TurnUsage,
   toAcpStopReason,
+  USAGE_META_KEY,
 } from "./session-options.ts";
 
-export const AGENT_VERSION = "0.1.0";
+export const AGENT_VERSION = "0.2.0";
 
 interface AgentSession {
   settings: SessionSettings;
@@ -85,39 +88,41 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       session.history.push(promptToUserMessage(ctx.params.prompt));
 
       const updates = createUpdateStream(ctx.client, ctx.params.sessionId);
+      const calls: ModelCallUsage[] = [];
       const sink: EventSink = {
         emit(event) {
           updates.forward(event);
           recordHistory(session.history, event);
+          if (event.type === "llm.done") {
+            calls.push({ model: event.data.model, purpose: "turn", usage: event.data.usage });
+          }
         },
       };
       const { settings } = session;
       const tools = await session.router.availableTools();
       const languageModel = opts.resolveModel(settings.model);
-      // A fold's summary is part of what the turn spent.
-      const summaryUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
       const config: EngineConfig = {
         ...engineConfigOf(settings, turn.signal),
         hooks: contextHooks({
           model: settings.model,
-          languageModel,
           system: settings.system,
           tools,
           maxInputTokens: settings.maxInputTokens,
           maxOutputTokens: settings.maxOutputTokens,
-          onSummaryUsage: (usage) => addUsage(summaryUsage, usage),
+          summarizer: summarizerOf(settings, languageModel, opts.resolveModel, (model, usage) =>
+            calls.push({ model, purpose: "summary", usage }),
+          ),
         }),
       };
       const engine = new AgentEngine(languageModel, session.router, sink);
       try {
         const result = await engine.run(config, settings.system, [...session.history], tools);
         await updates.drained();
-        const usage = { ...result.usage };
-        addUsage(usage, summaryUsage);
+        const usage = turnUsage(calls);
         return {
           stopReason: toAcpStopReason(result.stopReason),
-          usage: acpUsage(usage),
-          _meta: { [STOP_REASON_META_KEY]: result.stopReason },
+          usage: acpUsage(usage.total),
+          _meta: { [STOP_REASON_META_KEY]: result.stopReason, [USAGE_META_KEY]: usage },
         };
       } catch (err) {
         await updates.drained();
@@ -157,6 +162,28 @@ function engineConfigOf(settings: SessionSettings, signal: AbortSignal): EngineC
     ...(settings.thinking ? { thinking: settings.thinking } : {}),
     signal,
   };
+}
+
+/** Who writes the session's mid-turn folds, or nobody when it turned them off. */
+function summarizerOf(
+  settings: SessionSettings,
+  languageModel: LanguageModelV4,
+  resolveModel: ModelResolver,
+  onUsage: (model: string, usage: TokenUsage) => void,
+): TurnContext["summarizer"] {
+  if (settings.compaction === false) return undefined;
+  const model = settings.compaction?.model ?? settings.model;
+  return {
+    model,
+    languageModel: model === settings.model ? languageModel : resolveModel(model),
+    onUsage: (usage) => onUsage(model, usage),
+  };
+}
+
+function turnUsage(calls: ModelCallUsage[]): TurnUsage {
+  const total = { inputTokens: 0, outputTokens: 0 };
+  for (const call of calls) addUsage(total, call.usage);
+  return { calls, total };
 }
 
 /** The run's usage in ACP's (unstable) turn-usage shape. */
