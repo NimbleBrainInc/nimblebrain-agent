@@ -2,8 +2,7 @@
  * nimblebrain-agent's context management for one turn: what keeps the working history
  * inside the model's window while the loop runs.
  *
- * The same two mechanisms NimbleBrain's native engine runs, wired the same
- * way: windowing on every model call (`transformContext`, with the provider's
+ * Two mechanisms: windowing on every model call (`transformContext`, with the provider's
  * reasoning replay policy), and a mid-turn fold that summarizes older history
  * when the turn outgrows its budget (`rewriteHistory`). The fold runs only when
  * the session allows it, and its summary is written by the session's summarizer

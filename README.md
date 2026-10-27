@@ -4,9 +4,9 @@ An agent runtime that speaks the [Agent Client Protocol](https://agentclientprot
 Any ACP client can drive it: an editor, a CLI, or a host such as NimbleBrain that owns the
 conversation and hands nimblebrain-agent one turn at a time.
 
-nimblebrain-agent is NimbleBrain's agent loop, extracted. It runs the loop, calls the model, calls the tools
-of the MCP servers the client names, keeps the turn's context inside the model's window, streams
-what it does, and stops when told. It keeps no conversation store, no credentials beyond the model
+nimblebrain-agent runs the agent loop: it calls the model, calls the tools of the MCP servers the
+client names, keeps the turn's context inside the model's window, streams what it does, and stops
+when told. It keeps no conversation store, no credentials beyond the model
 key it is started with, and no tools of its own.
 
 ## Run it
@@ -72,8 +72,8 @@ A `session/prompt` response carries in `_meta`:
 - `"nimblebrain-agent/stopReason"`: nimblebrain-agent's own stop reason (for example
   `max_input_tokens`), finer than ACP's `stopReason`.
 - `"nimblebrain-agent/usage"`: every model call of the turn in the order it finished, each as
-  `{ model, purpose: "turn" | "summary", usage }`, and their `total`. `usage` is NimbleBrain's
-  `TokenUsage`, which keeps what ACP's `usage` drops: the 1-hour share of cache writes, and the
+  `{ model, purpose: "turn" | "summary", usage }`, and their `total`. `usage` is a
+  `TokenUsage` (`src/usage/types.ts`), which keeps what ACP's `usage` drops: the 1-hour share of cache writes, and the
   per-call split that tiered prices are computed from.
 
 ## Embedding
@@ -87,10 +87,9 @@ connect to any stream, or directly to an ACP client in the same process.
 bun run check        # typecheck src and tests
 bun run test         # unit and integration tests (no network, no key)
 bun run lint
-bun run sync:check <nimblebrain checkout>   # is the engine in step with NimbleBrain's?
 ```
 
-The engine is carried from NimbleBrain verbatim (`mirror.txt`); see `AGENTS.md`.
+Changing it: `AGENTS.md`.
 
 ## License
 

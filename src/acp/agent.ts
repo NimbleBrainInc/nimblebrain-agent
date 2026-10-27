@@ -1,5 +1,5 @@
 /**
- * nimblebrain-agent's ACP agent: NimbleBrain's engine loop, served over the Agent Client
+ * nimblebrain-agent's ACP agent: the engine loop, served over the Agent Client
  * Protocol to any client.
  *
  * Inside nimblebrain-agent: model inference, the loop, tool calls to the MCP servers the

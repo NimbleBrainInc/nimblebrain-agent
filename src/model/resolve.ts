@@ -4,8 +4,7 @@
  *
  * Each provider takes its key from its usual variable and an optional base
  * URL, so a host can point nimblebrain-agent at a gateway that holds the real keys and
- * meters the calls, with no change here. The providers are built as
- * NimbleBrain's native engine builds them, so a call behaves the same in both.
+ * meters the calls, with no change here.
  */
 
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -43,7 +42,7 @@ function resolveModel(model: string, env: Env): LanguageModelV4 {
         // Re-arms the stream watchdog on Anthropic's keep-alive pings (fetch-liveness.ts).
         fetch: wrapFetchWithLiveness(globalThis.fetch) as typeof fetch,
       });
-      // Tool arguments validated by the API before they stream, as the native engine runs it.
+      // Tool arguments are validated by the API before they stream.
       return wrapLanguageModel({
         model: anthropic.languageModel(modelId),
         middleware: defaultSettingsMiddleware({
