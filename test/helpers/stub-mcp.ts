@@ -13,7 +13,7 @@ export interface StubMcp {
 
 /** The stub's MCP server: one `lookup_order` tool, answered by `answer`, its calls kept in `calls`. */
 export function stubMcpServer(
-  answer: (input: Record<string, unknown>) => string,
+  answer: (input: Record<string, unknown>) => string | Promise<string>,
   calls: Record<string, unknown>[],
 ): Server {
   const server = new Server({ name: "stub", version: "1" }, { capabilities: { tools: {} } });
@@ -30,10 +30,10 @@ export function stubMcpServer(
       },
     ],
   }));
-  server.setRequestHandler("tools/call", (request) => {
+  server.setRequestHandler("tools/call", async (request) => {
     const input = (request.params.arguments ?? {}) as Record<string, unknown>;
     calls.push(input);
-    return { content: [{ type: "text", text: answer(input) }], isError: false };
+    return { content: [{ type: "text", text: await answer(input) }], isError: false };
   });
   return server;
 }

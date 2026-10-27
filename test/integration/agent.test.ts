@@ -409,25 +409,24 @@ describe("the agent with tools on the ACP connection", () => {
     s.close();
   });
 
-  test("a cancel mid-tool ends the turn as cancelled", async () => {
+  test("a cancel mid-tool ends the turn as cancelled and cancels the client's call", async () => {
     const { model } = recording([
       { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
       { text: "never" },
     ]);
-    const overAcp = acpStubMcp(() => "late");
     let cancel: (() => void) | undefined;
-    const s = await session(
-      model,
-      undefined,
-      (u) => {
-        if (u.sessionUpdate === "tool_call") cancel?.();
-      },
-      overAcp,
-    );
+    // The call stays pending on the client, and the cancel goes out once the client has it.
+    const overAcp = acpStubMcp(() => {
+      cancel?.();
+      return new Promise<string>(() => {});
+    });
+    const s = await session(model, undefined, undefined, overAcp);
     cancel = () =>
       void s.agent.notify(acp.methods.agent.session.cancel, { sessionId: s.sessionId });
     const response = await s.prompt("go");
     expect(response.stopReason).toBe("cancelled");
+    expect(overAcp.calls).toEqual([{ orderId: "1" }]);
+    expect(overAcp.cancelled).toHaveLength(1);
     s.close();
   });
 

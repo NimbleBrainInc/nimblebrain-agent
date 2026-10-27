@@ -29,7 +29,9 @@ export interface AcpStubMcp {
   serve(app: acp.ClientApp): acp.ClientApp;
 }
 
-export function acpStubMcp(answer: (input: Record<string, unknown>) => string): AcpStubMcp {
+export function acpStubMcp(
+  answer: (input: Record<string, unknown>) => string | Promise<string>,
+): AcpStubMcp {
   const calls: Record<string, unknown>[] = [];
   const cancelled: string[] = [];
   const serverId = `stub_${crypto.randomUUID()}`;
