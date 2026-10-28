@@ -7,7 +7,7 @@ conversation and hands nimblebrain-agent one turn at a time.
 nimblebrain-agent runs the agent loop: it calls the model, calls the tools of the MCP servers the
 client names, keeps the turn's context inside the model's window, streams what it does, and stops
 when told. It keeps no conversation store, no credentials beyond the model
-key it is started with, and no tools of its own.
+key it is started with (or a session's own model credential), and no tools of its own.
 
 ## Run it
 
@@ -28,6 +28,33 @@ Point an ACP client at that command. A session runs on these defaults:
 | `NB_AGENT_MAX_OUTPUT_TOKENS` | Output-token cap per model call | the model's own limit |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | The provider key | none |
 | `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | Send model calls to a gateway instead | the provider's |
+
+### As a worker
+
+`nimblebrain-agent serve` runs it as a long-lived worker: ACP over Streamable HTTP at `/acp`, many
+connections and sessions in one process, each connection with an agent of its own.
+
+```bash
+NB_AGENT_HOST=0.0.0.0 NB_AGENT_AUTH_JWKS_URL=http://runtime:27247/.well-known/run-keys.json \
+  NB_AGENT_AUTH_ISSUER=https://runtime.example bun src/cli.ts serve
+```
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NB_AGENT_HOST`, `NB_AGENT_PORT` | Address to serve on | `127.0.0.1`, `8080` |
+| `NB_AGENT_AUTH_JWKS_URL` | The runtime's public key set | required |
+| `NB_AGENT_AUTH_ISSUER` | The issuer the runtime's credentials name | required |
+| `NB_AGENT_AUTH=none` | No connection check; refused unless the host is loopback | |
+| `NB_AGENT_DRAIN_MS` | Longest a drain waits for the turns in flight | 900000 |
+
+- **Connection check.** Every request carries `Authorization: Bearer <credential>`, a JWS the
+  runtime signs with its run key (EdDSA): issuer `NB_AGENT_AUTH_ISSUER`, audience `acp-worker`, in
+  date. The worker verifies it against the key set, refetching it (at most every 30 seconds) for a
+  key id it does not know, so a key rotation needs no restart. Anything else is a 401.
+- **Probes.** `GET /healthz` answers while the process runs; `GET /readyz` answers 503 once it
+  drains.
+- **Drain.** On SIGTERM or SIGINT it refuses new connections and sessions, waits for the turns in
+  flight (at most `NB_AGENT_DRAIN_MS`), then closes.
 
 ## What nimblebrain-agent does
 
@@ -61,10 +88,15 @@ is optional; what is left out comes from the defaults above.
     "maxInputTokens": 200000,
     "maxOutputTokens": 8192,
     "thinking": { "mode": "effort", "effort": "medium", "source": "config" },
-    "compaction": { "model": "anthropic:claude-haiku-4-5" }  // or false: never fold
+    "compaction": { "model": "anthropic:claude-haiku-4-5" },  // or false: never fold
+    "modelCredential": "…"      // a bearer the session's model calls present instead of the key
   }
 }
 ```
+
+`modelCredential` is for a host whose model gateway issues a credential per turn: the session's
+calls send it as `Authorization: Bearer` to `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, in place of
+the worker's provider key. It is held in memory for the session's life and never logged.
 
 `history` is a JSON array of [AI SDK](https://ai-sdk.dev) `LanguageModelV4Message`s, with a file
 part's bytes written as `{ "__nb_agent_bytes": "<base64>" }`. The turn's own message is the

@@ -13,13 +13,24 @@ import type { LanguageModelV4 } from "@ai-sdk/provider";
 import { defaultSettingsMiddleware, wrapLanguageModel } from "ai";
 import { wrapFetchWithLiveness } from "./fetch-liveness.ts";
 
-export type ModelResolver = (model: string) => LanguageModelV4;
+/**
+ * How a session's model calls authenticate. `credential` is a bearer the
+ * client handed the session (a gateway's per-turn credential), presented in
+ * place of the process's provider key; absent, the provider key is used.
+ */
+export interface ModelAccess {
+  credential?: string;
+}
+
+export type ModelResolver = (model: string, access?: ModelAccess) => LanguageModelV4;
 
 type Env = Record<string, string | undefined>;
 
 export function createModelResolver(env: Env = process.env): ModelResolver {
   const cache = new Map<string, LanguageModelV4>();
-  return (model) => {
+  return (model, access) => {
+    // A session's own credential is never cached: it lives as long as the session.
+    if (access?.credential) return resolveModel(model, env, access.credential);
     const cached = cache.get(model);
     if (cached) return cached;
     const resolved = resolveModel(model, env);
@@ -28,7 +39,7 @@ export function createModelResolver(env: Env = process.env): ModelResolver {
   };
 }
 
-function resolveModel(model: string, env: Env): LanguageModelV4 {
+function resolveModel(model: string, env: Env, credential?: string): LanguageModelV4 {
   const separator = model.indexOf(":");
   if (separator < 0)
     throw new Error(`Model "${model}" names no provider (expected provider:model)`);
@@ -37,7 +48,10 @@ function resolveModel(model: string, env: Env): LanguageModelV4 {
   switch (provider) {
     case "anthropic": {
       const anthropic = createAnthropic({
-        apiKey: required(env, "ANTHROPIC_API_KEY"),
+        // A bearer credential goes as `Authorization: Bearer`, the gateway's scheme.
+        ...(credential
+          ? { authToken: credential }
+          : { apiKey: required(env, "ANTHROPIC_API_KEY") }),
         ...(env.ANTHROPIC_BASE_URL ? { baseURL: env.ANTHROPIC_BASE_URL } : {}),
         // Re-arms the stream watchdog on Anthropic's keep-alive pings (fetch-liveness.ts).
         fetch: wrapFetchWithLiveness(globalThis.fetch) as typeof fetch,
@@ -52,7 +66,7 @@ function resolveModel(model: string, env: Env): LanguageModelV4 {
     }
     case "openai":
       return createOpenAI({
-        apiKey: required(env, "OPENAI_API_KEY"),
+        apiKey: credential ?? required(env, "OPENAI_API_KEY"),
         ...(env.OPENAI_BASE_URL ? { baseURL: env.OPENAI_BASE_URL } : {}),
       }).languageModel(modelId);
     default:

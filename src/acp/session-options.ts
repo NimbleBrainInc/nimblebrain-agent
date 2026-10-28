@@ -16,6 +16,7 @@
  *     maxIterations?: number, maxInputTokens?: number, maxOutputTokens?: number,
  *     thinking?: ResolvedThinking,
  *     compaction?: false | { model?: string },  // mid-turn fold: off, or its summarizer model
+ *     modelCredential?: string,  // bearer the session's model calls present instead of the worker's key
  *   } }
  *
  * A `session/prompt` response carries nimblebrain-agent's own stop reason under
@@ -74,6 +75,12 @@ export interface SessionSettings {
 export type SessionOptions = Partial<SessionSettings> & {
   /** Prior history, oldest first, encoded with {@link encodeMessages}. */
   history?: string;
+  /**
+   * A bearer credential the session's model calls present in place of the
+   * worker's provider key: a model gateway's per-turn credential. Held in
+   * memory for the session's life and never logged.
+   */
+  modelCredential?: string;
 };
 
 const BYTES_TAG = "__nb_agent_bytes";

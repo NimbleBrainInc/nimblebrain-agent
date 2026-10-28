@@ -4,6 +4,8 @@
  *
  *   nimblebrain-agent acp        Serve the Agent Client Protocol on stdio (stdout carries
  *                     the protocol; every log line goes to stderr).
+ *   nimblebrain-agent serve      Serve it over Streamable HTTP as a long-lived worker
+ *                     (`src/serve/http.ts`), until SIGTERM drains it.
  *   nimblebrain-agent --version
  *
  * A session's defaults come from the environment, and a client's session
@@ -16,12 +18,24 @@
  *   NB_AGENT_MAX_OUTPUT_TOKENS  per-call output cap    default: the model's own limit
  *
  * Model keys: ANTHROPIC_API_KEY / OPENAI_API_KEY, with ANTHROPIC_BASE_URL /
- * OPENAI_BASE_URL to send calls through a gateway instead.
+ * OPENAI_BASE_URL to send calls through a gateway instead. A session that
+ * brings its own model credential presents that instead of the key.
+ *
+ * `serve` reads:
+ *
+ *   NB_AGENT_HOST               address to bind       default 127.0.0.1
+ *   NB_AGENT_PORT               port                   default 8080
+ *   NB_AGENT_DRAIN_MS           longest drain wait     default 900000
+ *   NB_AGENT_AUTH_JWKS_URL      the runtime's public key set, which connection credentials verify against
+ *   NB_AGENT_AUTH_ISSUER        the issuer those credentials name (the runtime's public origin)
+ *   NB_AGENT_AUTH=none          no connection check; refused unless NB_AGENT_HOST is loopback
  */
 
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import { createAgent, AGENT_VERSION } from "./acp/agent.ts";
+import { type ConnectionAuth, createConnectionAuth } from "./serve/connection-auth.ts";
+import { serveHttp } from "./serve/http.ts";
 import type { SessionSettings } from "./acp/session-options.ts";
 import { DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS } from "./limits.ts";
 import { createModelResolver } from "./model/resolve.ts";
@@ -75,6 +89,44 @@ export async function serveAcp(env: Env = process.env): Promise<void> {
   await connection.closed;
 }
 
+const DEFAULT_PORT = 8080;
+const DEFAULT_DRAIN_MS = 15 * 60_000;
+
+/** The connection check `serve` runs, from the environment. */
+export function connectionAuthFrom(env: Env): ConnectionAuth | null {
+  if (env.NB_AGENT_AUTH === "none") return null;
+  const jwksUrl = env.NB_AGENT_AUTH_JWKS_URL;
+  const issuer = env.NB_AGENT_AUTH_ISSUER;
+  if (!jwksUrl || !issuer) {
+    throw new Error(
+      "serve needs NB_AGENT_AUTH_JWKS_URL and NB_AGENT_AUTH_ISSUER (or NB_AGENT_AUTH=none on loopback)",
+    );
+  }
+  return createConnectionAuth({ jwksUrl, issuer });
+}
+
+/** Serve over HTTP until SIGTERM or SIGINT, then drain. */
+export async function serveWorker(env: Env = process.env): Promise<void> {
+  const worker = await serveHttp(
+    { resolveModel: createModelResolver(env), defaults: defaultsFrom(env) },
+    {
+      hostname: env.NB_AGENT_HOST || "127.0.0.1",
+      port: intFrom(env, "NB_AGENT_PORT") ?? DEFAULT_PORT,
+      auth: connectionAuthFrom(env),
+      drainMs: intFrom(env, "NB_AGENT_DRAIN_MS") ?? DEFAULT_DRAIN_MS,
+    },
+  );
+  log.info(`[serve] nimblebrain-agent ${AGENT_VERSION} serving ACP at ${worker.url}`);
+  await new Promise<void>((resolve) => {
+    const drain = () => {
+      log.info("[serve] draining");
+      void worker.drain().then(resolve);
+    };
+    process.once("SIGTERM", drain);
+    process.once("SIGINT", drain);
+  });
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command] = argv;
   if (command === "--version" || command === "-v") {
@@ -85,7 +137,11 @@ async function main(argv: string[]): Promise<number> {
     await serveAcp();
     return 0;
   }
-  process.stderr.write("usage: nimblebrain-agent acp | nimblebrain-agent --version\n");
+  if (command === "serve") {
+    await serveWorker();
+    return 0;
+  }
+  process.stderr.write("usage: nimblebrain-agent acp | serve | --version\n");
   return command === undefined || command === "--help" || command === "-h" ? 0 : 2;
 }
 
