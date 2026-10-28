@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, type KeyObject, sign } from "node:crypto";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   CONNECTION_AUDIENCE,
   ConnectionRefused,
@@ -158,5 +161,106 @@ describe("connection check", () => {
     await expect(s.auth.check(`Bearer ${token(key, later)}`)).rejects.toThrow(/answered 503/);
     await expect(s.auth.check(`Bearer ${token(key, later)}`)).rejects.toThrow(/stale/);
     expect(s.fetches()).toBe(3);
+  });
+});
+
+describe("connection check against a key set file", () => {
+  /**
+   * A directory laid out as a Kubernetes Secret volume: `run-keys.json` links to
+   * `..data/run-keys.json`, and an update writes a new directory and swaps the
+   * `..data` symlink onto it.
+   */
+  function secretVolume(initial: ReturnType<typeof keyPair>[]) {
+    const dir = mkdtempSync(join(tmpdir(), "nb-agent-keys-"));
+    let version = 0;
+    const write = (keys: ReturnType<typeof keyPair>[]) => {
+      const target = `..v${++version}`;
+      mkdirSync(join(dir, target));
+      writeFileSync(
+        join(dir, target, "run-keys.json"),
+        JSON.stringify({ keys: keys.map((k) => ({ ...k.jwk, alg: "EdDSA", use: "sig" })) }),
+      );
+      symlinkSync(target, join(dir, "..data_tmp"));
+      renameSync(join(dir, "..data_tmp"), join(dir, "..data"));
+    };
+    write(initial);
+    symlinkSync("..data/run-keys.json", join(dir, "run-keys.json"));
+    return {
+      file: join(dir, "run-keys.json"),
+      write,
+      remove: () => rmSync(dir, { recursive: true }),
+    };
+  }
+
+  function setUpFile(initial: ReturnType<typeof keyPair>[]) {
+    const volume = secretVolume(initial);
+    let now = NOW_MS;
+    const auth = createConnectionAuth({ jwksFile: volume.file, issuer: ISSUER, now: () => now });
+    return {
+      auth,
+      volume,
+      advance: (ms: number) => {
+        now += ms;
+      },
+    };
+  }
+
+  test("accepts a credential the file's key set verifies", async () => {
+    const key = keyPair("k1");
+    const s = setUpFile([key]);
+    try {
+      await s.auth.check(`Bearer ${token(key, valid())}`);
+    } finally {
+      s.volume.remove();
+    }
+  });
+
+  test("refuses a credential signed by a key the file does not hold", async () => {
+    const s = setUpFile([keyPair("k1")]);
+    try {
+      // Same key id, another key: the signature does not verify.
+      await expect(s.auth.check(`Bearer ${token(keyPair("k1"), valid())}`)).rejects.toThrow(
+        /bad signature/,
+      );
+      await expect(s.auth.check(`Bearer ${token(keyPair("k9"), valid())}`)).rejects.toThrow(
+        /unknown key/,
+      );
+    } finally {
+      s.volume.remove();
+    }
+  });
+
+  test("picks up a key set swapped in under the file, with no restart", async () => {
+    const old = keyPair("k1");
+    const rotated = keyPair("k2");
+    const s = setUpFile([old]);
+    try {
+      await s.auth.check(`Bearer ${token(old, valid())}`);
+
+      s.volume.write([rotated, old]);
+      // Within the interval an unknown key id does not reread.
+      await expect(s.auth.check(`Bearer ${token(rotated, valid())}`)).rejects.toThrow(
+        /unknown key/,
+      );
+      s.advance(30_000);
+      await s.auth.check(`Bearer ${token(rotated, valid())}`);
+      await s.auth.check(`Bearer ${token(old, valid())}`);
+
+      // A key dropped from the file stops verifying once the set ages out.
+      s.volume.write([rotated]);
+      s.advance(300_000);
+      const later = valid({ iat: (NOW_MS + 330_000) / 1000, exp: (NOW_MS + 600_000) / 1000 });
+      await expect(s.auth.check(`Bearer ${token(old, later)}`)).rejects.toThrow(/unknown key/);
+      await s.auth.check(`Bearer ${token(rotated, later)}`);
+    } finally {
+      s.volume.remove();
+    }
+  });
+
+  test("takes exactly one of a URL and a file", () => {
+    expect(() => createConnectionAuth({ issuer: ISSUER })).toThrow(/exactly one/);
+    expect(() =>
+      createConnectionAuth({ issuer: ISSUER, jwksUrl: "http://r/keys", jwksFile: "/keys.json" }),
+    ).toThrow(/exactly one/);
   });
 });

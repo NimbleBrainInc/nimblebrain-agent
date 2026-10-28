@@ -4,16 +4,21 @@
  *
  * The credential is a compact JWS (`alg: EdDSA`, Ed25519) the runtime signs
  * with its run key. The worker holds no secret to check it with: it reads the
- * runtime's public key set from a URL it is configured with, and verifies the
- * issuer, the audience (`acp-worker`, which no other credential the runtime
- * mints carries), and the expiry. A key it does not know, or a key set older
- * than its maximum age, sends it back to the key set, at most once per refresh
- * interval whether the fetch succeeds or fails: a rotation is picked up, a key
- * removed from the set stops verifying within the maximum age, and a flood of
- * unknown key ids is not a flood of fetches. A set it cannot refresh past its
- * maximum age verifies nothing.
+ * runtime's public key set from a URL or a file it is configured with, and
+ * verifies the issuer, the audience (`acp-worker`, which no other credential
+ * the runtime mints carries), and the expiry. A key it does not know, or a key
+ * set older than its maximum age, sends it back to the key set, at most once
+ * per refresh interval whether the read succeeds or fails: a rotation is picked
+ * up, a key removed from the set stops verifying within the maximum age, and a
+ * flood of unknown key ids is not a flood of reads. A set it cannot refresh
+ * past its maximum age verifies nothing.
+ *
+ * A file is read again by path on every refresh, so a file replaced in place
+ * (a Kubernetes Secret volume swaps its `..data` symlink) rotates the keys with
+ * no restart.
  */
 
+import { readFile } from "node:fs/promises";
 import { createPublicKey, type KeyObject, verify } from "node:crypto";
 
 /** The audience of a connection credential. */
@@ -29,8 +34,10 @@ const REFRESH_INTERVAL_MS = 30_000;
 const MAX_KEY_SET_AGE_MS = 300_000;
 
 export interface ConnectionAuthOptions {
-  /** The runtime's public key set (its `/.well-known/run-keys.json`). */
-  jwksUrl: string;
+  /** The runtime's public key set (its `/.well-known/run-keys.json`). Exactly one of this and `jwksFile`. */
+  jwksUrl?: string;
+  /** A file holding that key set, in the same shape. Exactly one of this and `jwksUrl`. */
+  jwksFile?: string;
   /** The issuer the runtime names itself as: its public origin. */
   issuer: string;
   audience?: string;
@@ -55,8 +62,8 @@ interface Jwk {
 
 export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAuth {
   const audience = opts.audience ?? CONNECTION_AUDIENCE;
-  const fetchFn = opts.fetch ?? globalThis.fetch;
   const now = opts.now ?? Date.now;
+  const loadKeySet = keySetSource(opts);
   let keys = new Map<string, KeyObject>();
   let fetchedAt = Number.NEGATIVE_INFINITY;
   let attemptedAt = Number.NEGATIVE_INFINITY;
@@ -66,7 +73,7 @@ export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAut
     inFlight ??= (async () => {
       attemptedAt = now();
       try {
-        keys = await fetchKeySet(fetchFn, opts.jwksUrl);
+        keys = await loadKeySet();
         fetchedAt = now();
       } catch (err) {
         if (err instanceof ConnectionRefused) throw err;
@@ -105,14 +112,21 @@ export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAut
   };
 }
 
+/** Where the key set is read from: the one of `jwksUrl` and `jwksFile` that is set. */
+function keySetSource(opts: ConnectionAuthOptions): () => Promise<Map<string, KeyObject>> {
+  const { jwksUrl, jwksFile } = opts;
+  if (!jwksUrl === !jwksFile) throw new Error("name exactly one of jwksUrl and jwksFile");
+  if (jwksFile) return async () => keySetFrom(JSON.parse(await readFile(jwksFile, "utf8")));
+  const fetchFn = opts.fetch ?? globalThis.fetch;
+  return async () => {
+    const res = await fetchFn(jwksUrl!);
+    if (!res.ok) throw new ConnectionRefused(`key set answered ${res.status}`);
+    return keySetFrom((await res.json()) as { keys?: Jwk[] });
+  };
+}
+
 /** The runtime's Ed25519 keys by key id; other keys in the set are skipped. */
-async function fetchKeySet(
-  fetchFn: typeof globalThis.fetch,
-  url: string,
-): Promise<Map<string, KeyObject>> {
-  const res = await fetchFn(url);
-  if (!res.ok) throw new ConnectionRefused(`key set answered ${res.status}`);
-  const body = (await res.json()) as { keys?: Jwk[] };
+function keySetFrom(body: { keys?: Jwk[] }): Map<string, KeyObject> {
   const keys = new Map<string, KeyObject>();
   for (const jwk of body.keys ?? []) {
     if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || !jwk.kid || !jwk.x) continue;
