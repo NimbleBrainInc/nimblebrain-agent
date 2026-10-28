@@ -15,6 +15,7 @@ import {
   type TurnUsage,
   USAGE_META_KEY,
 } from "../../src/acp/session-options.ts";
+import type { ModelAccess, ModelResolver } from "../../src/model/resolve.ts";
 import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
 import { type AcpStubMcp, acpStubMcp } from "../helpers/acp-stub-mcp.ts";
 import { type StubMcp, startStubMcp } from "../helpers/stub-mcp.ts";
@@ -101,7 +102,7 @@ function providerUsage(u: {
 }
 
 async function session(
-  model: LanguageModelV4 | ((id: string) => LanguageModelV4),
+  model: LanguageModelV4 | ModelResolver,
   meta?: Record<string, unknown>,
   onUpdate?: (u: acp.SessionUpdate) => void,
   overAcp?: AcpStubMcp,
@@ -454,5 +455,27 @@ describe("the agent's model endpoint option", () => {
     await expect(
       session(model, { [SESSION_META_KEY]: { modelEndpoint: "https://elsewhere.example/v1" } }),
     ).rejects.toThrow(/modelEndpoint needs the session's own modelCredential/);
+  });
+
+  test("reaches the model resolver beside the session's credential", async () => {
+    const { model } = recording([{ text: "ok" }]);
+    const accesses: (ModelAccess | undefined)[] = [];
+    const s = await session(
+      (_id, access) => {
+        accesses.push(access);
+        return model;
+      },
+      {
+        [SESSION_META_KEY]: {
+          modelCredential: "turn-jwt",
+          modelEndpoint: "https://gateway.example/v1",
+        },
+      },
+    );
+    await s.prompt("hi");
+    expect(accesses.length).toBeGreaterThan(0);
+    for (const access of accesses)
+      expect(access).toEqual({ credential: "turn-jwt", endpoint: "https://gateway.example/v1" });
+    s.close();
   });
 });

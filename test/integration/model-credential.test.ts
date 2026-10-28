@@ -29,11 +29,9 @@ async function callOnce(
   resolve: ReturnType<typeof createModelResolver>,
   credential?: string,
   endpoint?: string,
+  modelName = "anthropic:claude-sonnet-4-6",
 ) {
-  const model = resolve(
-    "anthropic:claude-sonnet-4-6",
-    credential || endpoint ? { credential, endpoint } : undefined,
-  );
+  const model = resolve(modelName, credential || endpoint ? { credential, endpoint } : undefined);
   try {
     await model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] });
   } catch {
@@ -62,37 +60,57 @@ test("a session credential needs no provider key in the environment", async () =
   expect(seen[0]?.get("authorization")).toBe("Bearer turn-jwt");
 });
 
-test("a session endpoint takes the session's calls, but only beside its own credential", async () => {
-  const workerSeen: Headers[] = [];
-  const workerGateway = startGateway(workerSeen);
-  const sessionSeen: Headers[] = [];
-  const sessionGatewayServer = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(req) {
-      sessionSeen.push(req.headers);
-      return Response.json(
-        { error: { type: "authentication_error", message: "no" } },
-        { status: 401 },
-      );
-    },
-  });
-  const sessionGateway = `http://127.0.0.1:${sessionGatewayServer.port}/v1`;
-  try {
-    const resolve = createModelResolver({
-      ANTHROPIC_API_KEY: "worker-key",
-      ANTHROPIC_BASE_URL: workerGateway,
-    });
-    await callOnce(resolve, "turn-jwt", sessionGateway);
-    expect(sessionSeen.map((h) => h.get("authorization"))).toEqual(["Bearer turn-jwt"]);
-    expect(workerSeen).toEqual([]);
+// How each provider presents the worker's own key, and the variables it is configured from.
+const providers = [
+  {
+    model: "anthropic:claude-sonnet-4-6",
+    keyVar: "ANTHROPIC_API_KEY",
+    baseVar: "ANTHROPIC_BASE_URL",
+    workerKey: (h: Headers) => h.get("x-api-key"),
+    workerKeySent: "worker-key",
+  },
+  {
+    model: "openai:gpt-5",
+    keyVar: "OPENAI_API_KEY",
+    baseVar: "OPENAI_BASE_URL",
+    workerKey: (h: Headers) => h.get("authorization"),
+    workerKeySent: "Bearer worker-key",
+  },
+];
 
-    // Without the session's own credential the endpoint is ignored: the worker's
-    // key never goes to an address a client named.
-    await callOnce(resolve, undefined, sessionGateway);
-    expect(sessionSeen).toHaveLength(1);
-    expect(workerSeen.map((h) => h.get("x-api-key"))).toEqual(["worker-key"]);
-  } finally {
-    await sessionGatewayServer.stop(true);
-  }
-});
+for (const p of providers) {
+  test(`${p.model.split(":")[0]}: a session endpoint takes the session's calls, but only beside its own credential`, async () => {
+    const workerSeen: Headers[] = [];
+    const workerGateway = startGateway(workerSeen);
+    const sessionSeen: Headers[] = [];
+    const sessionGatewayServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        sessionSeen.push(req.headers);
+        return Response.json(
+          { error: { type: "authentication_error", message: "no" } },
+          { status: 401 },
+        );
+      },
+    });
+    const sessionGateway = `http://127.0.0.1:${sessionGatewayServer.port}/v1`;
+    try {
+      const resolve = createModelResolver({
+        [p.keyVar]: "worker-key",
+        [p.baseVar]: workerGateway,
+      });
+      await callOnce(resolve, "turn-jwt", sessionGateway, p.model);
+      expect(sessionSeen.map((h) => h.get("authorization"))).toEqual(["Bearer turn-jwt"]);
+      expect(workerSeen).toEqual([]);
+
+      // Without the session's own credential the endpoint is ignored: the worker's
+      // key never goes to an address a client named.
+      await callOnce(resolve, undefined, sessionGateway, p.model);
+      expect(sessionSeen).toHaveLength(1);
+      expect(workerSeen.map(p.workerKey)).toEqual([p.workerKeySent]);
+    } finally {
+      await sessionGatewayServer.stop(true);
+    }
+  });
+}
