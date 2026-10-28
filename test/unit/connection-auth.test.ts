@@ -36,6 +36,7 @@ const valid = (overrides: Record<string, unknown> = {}) => ({
 
 function setUp(initial: ReturnType<typeof keyPair>[]) {
   let served = initial;
+  let status = 200;
   let fetches = 0;
   let now = NOW_MS;
   const auth = createConnectionAuth({
@@ -44,6 +45,7 @@ function setUp(initial: ReturnType<typeof keyPair>[]) {
     now: () => now,
     fetch: (async () => {
       fetches++;
+      if (status !== 200) return new Response(null, { status });
       return Response.json({ keys: served.map((k) => k.jwk) });
     }) as unknown as typeof fetch,
   });
@@ -52,6 +54,9 @@ function setUp(initial: ReturnType<typeof keyPair>[]) {
     fetches: () => fetches,
     serve: (keys: ReturnType<typeof keyPair>[]) => {
       served = keys;
+    },
+    answer: (code: number) => {
+      status = code;
     },
     advance: (ms: number) => {
       now += ms;
@@ -113,5 +118,45 @@ describe("connection check", () => {
     expect(s.fetches()).toBe(2);
     // The outgoing key still verifies until it leaves the set.
     await s.auth.check(`Bearer ${token(old, valid())}`);
+  });
+
+  test("stops honoring a removed key once the key set ages out, with no unknown-key traffic", async () => {
+    const old = keyPair("k1");
+    const s = setUp([old]);
+    await s.auth.check(`Bearer ${token(old, valid())}`);
+
+    s.serve([keyPair("k2")]);
+    s.advance(300_000);
+    await expect(
+      s.auth.check(
+        `Bearer ${token(old, valid({ iat: (NOW_MS + 300_000) / 1000, exp: (NOW_MS + 600_000) / 1000 }))}`,
+      ),
+    ).rejects.toThrow(/unknown key/);
+    expect(s.fetches()).toBe(2);
+  });
+
+  test("throttles refetches after a failed fetch, and refuses on a key set it cannot refresh", async () => {
+    const key = keyPair("k1");
+    const s = setUp([key]);
+    s.answer(503);
+    for (let i = 0; i < 5; i++) {
+      await expect(s.auth.check(`Bearer ${token(key, valid())}`)).rejects.toBeInstanceOf(
+        ConnectionRefused,
+      );
+    }
+    expect(s.fetches()).toBe(1);
+
+    s.answer(200);
+    s.advance(30_000);
+    await s.auth.check(`Bearer ${token(key, valid())}`);
+    expect(s.fetches()).toBe(2);
+
+    // Past its maximum age a set that cannot be refreshed verifies nothing.
+    s.answer(503);
+    s.advance(300_000);
+    const later = valid({ iat: (NOW_MS + 330_000) / 1000, exp: (NOW_MS + 600_000) / 1000 });
+    await expect(s.auth.check(`Bearer ${token(key, later)}`)).rejects.toThrow(/answered 503/);
+    await expect(s.auth.check(`Bearer ${token(key, later)}`)).rejects.toThrow(/stale/);
+    expect(s.fetches()).toBe(3);
   });
 });

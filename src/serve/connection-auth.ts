@@ -6,9 +6,12 @@
  * with its run key. The worker holds no secret to check it with: it reads the
  * runtime's public key set from a URL it is configured with, and verifies the
  * issuer, the audience (`acp-worker`, which no other credential the runtime
- * mints carries), and the expiry. A key it does not know sends it back to the
- * key set, at most once per refresh interval, so a rotation is picked up and a
- * flood of unknown key ids is not a flood of fetches.
+ * mints carries), and the expiry. A key it does not know, or a key set older
+ * than its maximum age, sends it back to the key set, at most once per refresh
+ * interval whether the fetch succeeds or fails: a rotation is picked up, a key
+ * removed from the set stops verifying within the maximum age, and a flood of
+ * unknown key ids is not a flood of fetches. A set it cannot refresh past its
+ * maximum age verifies nothing.
  */
 
 import { createPublicKey, type KeyObject, verify } from "node:crypto";
@@ -21,6 +24,9 @@ const LEEWAY_S = 60;
 
 /** The least time between two fetches of the key set. */
 const REFRESH_INTERVAL_MS = 30_000;
+
+/** How long a fetched key set is trusted: the bound on honoring a removed key. */
+const MAX_KEY_SET_AGE_MS = 300_000;
 
 export interface ConnectionAuthOptions {
   /** The runtime's public key set (its `/.well-known/run-keys.json`). */
@@ -53,24 +59,20 @@ export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAut
   const now = opts.now ?? Date.now;
   let keys = new Map<string, KeyObject>();
   let fetchedAt = Number.NEGATIVE_INFINITY;
+  let attemptedAt = Number.NEGATIVE_INFINITY;
   let inFlight: Promise<void> | null = null;
 
   const refresh = () => {
     inFlight ??= (async () => {
+      attemptedAt = now();
       try {
-        const res = await fetchFn(opts.jwksUrl);
-        if (!res.ok) throw new ConnectionRefused(`key set answered ${res.status}`);
-        const body = (await res.json()) as { keys?: Jwk[] };
-        const next = new Map<string, KeyObject>();
-        for (const jwk of body.keys ?? []) {
-          if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || !jwk.kid || !jwk.x) continue;
-          next.set(
-            jwk.kid,
-            createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: jwk.x }, format: "jwk" }),
-          );
-        }
-        keys = next;
+        keys = await fetchKeySet(fetchFn, opts.jwksUrl);
         fetchedAt = now();
+      } catch (err) {
+        if (err instanceof ConnectionRefused) throw err;
+        throw new ConnectionRefused(
+          `key set unreachable: ${err instanceof Error ? err.message : String(err)}`,
+        );
       } finally {
         inFlight = null;
       }
@@ -78,12 +80,16 @@ export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAut
     return inFlight;
   };
 
+  const fresh = () => now() - fetchedAt < MAX_KEY_SET_AGE_MS;
+
   const keyFor = async (kid: string): Promise<KeyObject> => {
     const known = keys.get(kid);
-    if (known) return known;
-    if (now() - fetchedAt >= REFRESH_INTERVAL_MS) await refresh();
+    if (known && fresh()) return known;
+    // A fetch in flight is joined, so a burst at start waits for the one fetch.
+    if (inFlight || now() - attemptedAt >= REFRESH_INTERVAL_MS) await refresh();
     const fetched = keys.get(kid);
     if (!fetched) throw new ConnectionRefused("unknown key id");
+    if (!fresh()) throw new ConnectionRefused("key set stale");
     return fetched;
   };
 
@@ -97,6 +103,25 @@ export function createConnectionAuth(opts: ConnectionAuthOptions): ConnectionAut
       checkClaims(jws.claims, { issuer: opts.issuer, audience, nowS: now() / 1000 });
     },
   };
+}
+
+/** The runtime's Ed25519 keys by key id; other keys in the set are skipped. */
+async function fetchKeySet(
+  fetchFn: typeof globalThis.fetch,
+  url: string,
+): Promise<Map<string, KeyObject>> {
+  const res = await fetchFn(url);
+  if (!res.ok) throw new ConnectionRefused(`key set answered ${res.status}`);
+  const body = (await res.json()) as { keys?: Jwk[] };
+  const keys = new Map<string, KeyObject>();
+  for (const jwk of body.keys ?? []) {
+    if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || !jwk.kid || !jwk.x) continue;
+    keys.set(
+      jwk.kid,
+      createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: jwk.x }, format: "jwk" }),
+    );
+  }
+  return keys;
 }
 
 interface Jws {
