@@ -1,0 +1,225 @@
+name: Release
+
+# Release the worker image on a `v*` tag.
+#
+# PROMOTE-BY-RETAG, not rebuild. The tagged commit already merged to main, so
+# ci.yml already built + pushed its `:<sha>` image to ECR. A release RE-TAGS that
+# exact manifest as `:vX.Y.Z`, so what ships is byte-for-byte what main built and
+# tested (the source-image-exists guard below is the proof ci.yml gated it).
+#
+#   ECR  (deploys)          : retag :<sha> -> :vX.Y.Z via put-image.
+#   GHCR (public pulls)     : copy the same ECR :<sha> manifest to the GHCR tags via
+#                             `buildx imagetools create`; main never pushes GHCR, so
+#                             the release distributes there, still no rebuild. GA
+#                             also moves `:latest`.
+#
+# The image reports the version its source names (`AGENT_VERSION`, `package.json`),
+# since a retag cannot change it: cut `vX.Y.Z` from a commit whose source names X.Y.Z.
+#
+# Guards: the ECR repo must be IMMUTABLE, and the `:<sha>` source must exist (if not,
+# the commit never built on main — fail loud; re-run via workflow_dispatch with
+# rebuild=true for an EMERGENCY rebuild).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.5.1"
+        required: true
+      rebuild:
+        description: "EMERGENCY: rebuild from source instead of promoting the image main built (only for a tag off a commit that never built on main)"
+        type: boolean
+        default: false
+
+concurrency:
+  # Normalize across triggers: ref_name is `v0.5.1` on a tag push, matching the
+  # workflow_dispatch `tag` input — so a tag-push and a manual dispatch of the same
+  # version share one group and can't race on the immutable ECR :vX.Y.Z.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ECR_REPO: nimblebrain/nimblebrain-agent
+  GHCR_IMAGE: ghcr.io/nimblebraininc/nimblebrain-agent
+
+jobs:
+  release:
+    name: Promote release image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # AWS OIDC (ECR)
+      contents: read
+      packages: write   # GHCR push
+    steps:
+      # A release has nothing to promote without ECR, so an unconfigured repo fails
+      # here with the reason, not later inside the AWS login.
+      - name: Check release config
+        env:
+          ROLE: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE" ]; then
+            echo "::error::release not configured (need the AWS_ROLE_ARN repo variable): no ECR image to promote"
+            exit 1
+          fi
+      # Check out the tagged commit (the `ref` covers both triggers). Shallow, same
+      # as ci.yml's build — so `git rev-parse --short HEAD` yields the same 7-char
+      # SHA ci.yml tagged the image with.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version + source SHA
+        id: r
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          # Require vX.Y.Z (optional -prerelease / +build). A garbage version would
+          # burn an immutable tag, so reject it before anything is written.
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$VERSION' is not vX.Y.Z (with optional -prerelease)"; exit 1
+          fi
+          SHA="$(git rev-parse --short HEAD)"
+          # Pre-release semver tags contain a hyphen (v0.5.0-rc.1); GA tags don't.
+          # Only GA moves GHCR :latest.
+          case "$VERSION" in *-*) PRERELEASE=true ;; *) PRERELEASE=false ;; esac
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── EMERGENCY rebuild path (workflow_dispatch + rebuild=true) ──────────────
+      # Build from source instead of promoting the image main built. Loud on purpose:
+      # the release won't be byte-for-byte. Pushes the same ECR + GHCR tag set the
+      # normal path produces.
+      - name: Compute rebuild tags (EMERGENCY)
+        if: ${{ github.event.inputs.rebuild == 'true' }}
+        id: rb
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+          VERSION: ${{ steps.r.outputs.version }}
+          SHA: ${{ steps.r.outputs.sha }}
+          PRERELEASE: ${{ steps.r.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tags=(
+            "$REG/$ECR_REPO:$VERSION"
+            "$GHCR_IMAGE:$VERSION"
+            "$GHCR_IMAGE:$SHA"
+          )
+          if [ "$PRERELEASE" = "false" ]; then
+            tags+=("$GHCR_IMAGE:latest")
+          fi
+          {
+            echo "tags<<EOF"; printf '%s\n' "${tags[@]}"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Rebuild + push (EMERGENCY)
+        if: ${{ github.event.inputs.rebuild == 'true' }}
+        uses: ./.github/actions/build-push-image
+        with:
+          context: .
+          file: Dockerfile
+          cache-scope: agent
+          tags: ${{ steps.rb.outputs.tags }}
+      - name: Flag emergency rebuild
+        if: ${{ github.event.inputs.rebuild == 'true' }}
+        run: echo "::warning::REBUILT the worker image for ${{ steps.r.outputs.version }} from source — NOT the image main built and tested. The release is not byte-for-byte."
+
+      # ── Normal path: promote-by-retag ─────────────────────────────────────────
+      # ECR: retag the :<sha> manifest -> :vX.Y.Z, with three guards (immutable repo /
+      # source exists / idempotent). Every guard runs before anything is written.
+      - name: Promote-by-retag in ECR
+        if: ${{ github.event.inputs.rebuild != 'true' }}
+        env:
+          VERSION: ${{ steps.r.outputs.version }}
+          SRC: ${{ steps.r.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REPO="$ECR_REPO"
+
+          # Guard 1: the byte-for-byte promise needs an immutable repo.
+          MUT="$(aws ecr describe-repositories --repository-names "$REPO" --query 'repositories[0].imageTagMutability' --output text)"
+          [ "$MUT" = "IMMUTABLE" ] || { echo "::error::ECR repo $REPO is $MUT, not IMMUTABLE — refusing to promote-by-retag"; exit 1; }
+
+          # Guard 2: the source image ci.yml builds on main must exist. Absent → this
+          # tag is off a commit that never built on main.
+          MAN="$(aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$SRC" --query 'images[0].imageManifest' --output text 2>/dev/null || true)"
+          if [ -z "$MAN" ] || [ "$MAN" = "None" ]; then
+            echo "::error::No image $REPO:$SRC for this commit — it never built on main. To release anyway, re-run via 'Run workflow' with rebuild=true (and know the release won't be byte-for-byte)."
+            exit 1
+          fi
+
+          # Idempotent: if VERSION exists, this run is a re-run iff it's the same
+          # digest we'd promote (→ skip); a DIFFERENT digest means someone is
+          # re-releasing a version, which is not allowed (→ fail).
+          DSTDIG="$(aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$VERSION" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+          if [ -n "$DSTDIG" ] && [ "$DSTDIG" != "None" ]; then
+            SRCDIG="$(aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$SRC" --query 'imageDetails[0].imageDigest' --output text)"
+            if [ "$DSTDIG" = "$SRCDIG" ]; then
+              echo "already promoted ($REPO:$VERSION == $SRC) — nothing to retag"
+              exit 0
+            fi
+            echo "::error::$REPO:$VERSION already exists with a DIFFERENT digest — refusing to re-release a version"
+            exit 1
+          fi
+
+          aws ecr put-image --repository-name "$REPO" --image-tag "$VERSION" --image-manifest "$MAN" >/dev/null
+          echo "promoted $REPO:$SRC -> $REPO:$VERSION (no rebuild)"
+
+      # GHCR: main never pushes there, so distribute the public image by copying the
+      # same ECR :<sha> manifest to the GHCR tags (cross-registry, no rebuild). GA
+      # moves :latest.
+      - name: Distribute to GHCR (imagetools copy, no rebuild)
+        if: ${{ github.event.inputs.rebuild != 'true' }}
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+          VERSION: ${{ steps.r.outputs.version }}
+          SHA: ${{ steps.r.outputs.sha }}
+          PRERELEASE: ${{ steps.r.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tags=(
+            "$GHCR_IMAGE:$VERSION"
+            "$GHCR_IMAGE:$SHA"
+          )
+          if [ "$PRERELEASE" = "false" ]; then
+            tags+=("$GHCR_IMAGE:latest")
+          fi
+          args=(); for t in "${tags[@]}"; do args+=(-t "$t"); done
+          docker buildx imagetools create "${args[@]}" "$REG/$ECR_REPO:$SHA"
+          echo "distributed $SHA to GHCR as $VERSION"
+
+  github-release:
+    name: GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}

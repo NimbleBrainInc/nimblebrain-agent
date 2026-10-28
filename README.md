@@ -42,19 +42,35 @@ NB_AGENT_HOST=0.0.0.0 NB_AGENT_AUTH_JWKS_URL=http://runtime:27247/.well-known/ru
 | Variable | Meaning | Default |
 |---|---|---|
 | `NB_AGENT_HOST`, `NB_AGENT_PORT` | Address to serve on | `127.0.0.1`, `8080` |
-| `NB_AGENT_AUTH_JWKS_URL` | The runtime's public key set | required |
+| `NB_AGENT_AUTH_JWKS_URL` | The runtime's public key set | this or `NB_AGENT_AUTH_JWKS_FILE` |
+| `NB_AGENT_AUTH_JWKS_FILE` | A file holding that key set (`{"keys":[…]}`, the same shape) | this or `NB_AGENT_AUTH_JWKS_URL` |
 | `NB_AGENT_AUTH_ISSUER` | The issuer the runtime's credentials name | required |
 | `NB_AGENT_AUTH=none` | No connection check; refused unless the host is loopback | |
 | `NB_AGENT_DRAIN_MS` | Longest a drain waits for the turns in flight | 900000 |
 
 - **Connection check.** Every request carries `Authorization: Bearer <credential>`, a JWS the
   runtime signs with its run key (EdDSA): issuer `NB_AGENT_AUTH_ISSUER`, audience `acp-worker`, in
-  date. The worker verifies it against the key set, refetching it (at most every 30 seconds) for a
-  key id it does not know, so a key rotation needs no restart. Anything else is a 401.
+  date. The worker verifies it against the key set, rereading it (at most every 30 seconds) for a
+  key id it does not know and once the set is five minutes old, so a key rotation needs no
+  restart. The key set comes from exactly one of the URL and the file; the worker refuses to start
+  with both or neither. The file is reread by path, so a Kubernetes Secret mounted as a volume
+  rotates keys when the Secret changes. Anything else is a 401.
 - **Probes.** `GET /healthz` answers while the process runs; `GET /readyz` answers 503 once it
   drains.
 - **Drain.** On SIGTERM or SIGINT it refuses new connections and sessions, waits for the turns in
   flight (at most `NB_AGENT_DRAIN_MS`), then closes.
+
+### Container image
+
+The `Dockerfile` builds the worker: `serve` as UID 1000, on `0.0.0.0:8080`. Every commit on `main`
+pushes `nimblebrain/nimblebrain-agent:<short-sha>` to ECR; a `v*` tag promotes that image to
+`:vX.Y.Z` and copies it to `ghcr.io/nimblebraininc/nimblebrain-agent` (`release.yml`).
+
+```bash
+docker build -t nimblebrain-agent .
+docker run -p 8080:8080 -v ./keys:/keys:ro -e NB_AGENT_AUTH_JWKS_FILE=/keys/run-keys.json \
+  -e NB_AGENT_AUTH_ISSUER=https://runtime.example -e ANTHROPIC_API_KEY=… nimblebrain-agent
+```
 
 ## What nimblebrain-agent does
 

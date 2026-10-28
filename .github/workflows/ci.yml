@@ -30,3 +30,78 @@ jobs:
       - run: bun run check
       - run: bun run lint
       - run: bun run test
+
+  # Build + push a SHA-tagged worker image for every commit that lands on main, so
+  # any main commit can be deployed without a manual push. release.yml promotes
+  # that same `:<short-sha>` image to `:vX.Y.Z` (and GHCR) on a `v*` tag, with no
+  # rebuild. Needing `verify` means an image only exists in ECR if its tree passed
+  # the checks.
+  #
+  # The ECR repo is immutable: a `<sha>` tag is written once. `skip-existing`
+  # skips the build when this commit's tag is already pushed, so a second push
+  # run of the same commit, or "Re-run failed jobs" after a partial push,
+  # completes instead of failing on the immutable tag.
+  #
+  # `if` restricts this to pushes to main (post-merge), never PRs, so the OIDC/ECR
+  # credentials are never exposed to fork PRs. A push run is never cancelled: on a
+  # push there is no pull request, so the workflow's concurrency group is the
+  # run's own id.
+  #
+  # Optional until configured: with `vars.AWS_ROLE_ARN` unset (the ECR repo and
+  # its OIDC role not yet provisioned, or a fork) the job says so and pushes
+  # nothing, so CI stays green.
+  build-and-push:
+    name: Build & Push Image
+    needs: [verify]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Two push runs of one commit would otherwise build side by side, both find no
+    # `<sha>` tag, and the second push fails on the immutable tag. Queued per
+    # commit, the second starts after the first has pushed and skips its build.
+    concurrency:
+      group: build-and-push-${{ github.sha }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - name: Check image push config
+        id: cfg
+        env:
+          ROLE: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::image push not configured (need the AWS_ROLE_ARN repo variable) — skipping"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+      # buildx (docker-container driver) is required for the GitHub Actions layer
+      # cache used by ./.github/actions/build-push-image.
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: docker/setup-buildx-action@v4
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Set image tag
+        if: steps.cfg.outputs.enabled == 'true'
+        id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Build and push worker image
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: ./.github/actions/build-push-image
+        with:
+          context: .
+          file: Dockerfile
+          cache-scope: agent
+          skip-existing: "true"
+          tags: ${{ steps.ecr.outputs.registry }}/nimblebrain/nimblebrain-agent:${{ steps.tag.outputs.sha }}

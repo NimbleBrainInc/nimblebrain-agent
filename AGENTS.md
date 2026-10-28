@@ -12,7 +12,10 @@ bun run check && bun run test && bun run lint
 
 Every `bun` in the test path passes `--no-env-file`, so a developer's real keys never reach a test.
 
-CI (`.github/workflows/ci.yml`) runs the same checks on every change.
+CI (`.github/workflows/ci.yml`) runs the same checks on every change, and on `main` pushes the
+worker image (`Dockerfile`) to ECR; `release.yml` promotes it on a `v*` tag. The image's bun is
+pinned by digest and must equal CI's `BUN_VERSION` (`test/unit/build-pins.test.ts`): bump both
+together.
 
 ## Layout
 

@@ -1,0 +1,11 @@
+# Only package.json, bun.lock, bunfig.toml and src/ go into the image (Dockerfile).
+.git
+.gitignore
+.github
+.env*
+.DS_Store
+**/node_modules
+test/
+*.md
+Dockerfile
+.dockerignore
