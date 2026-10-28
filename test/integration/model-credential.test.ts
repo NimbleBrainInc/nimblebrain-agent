@@ -31,7 +31,7 @@ async function callOnce(
   endpoint?: string,
   modelName = "anthropic:claude-sonnet-4-6",
 ) {
-  const model = resolve(modelName, credential || endpoint ? { credential, endpoint } : undefined);
+  const model = resolve(modelName, credential ? { credential, endpoint } : undefined);
   try {
     await model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] });
   } catch {
@@ -104,9 +104,8 @@ for (const p of providers) {
       expect(sessionSeen.map((h) => h.get("authorization"))).toEqual(["Bearer turn-jwt"]);
       expect(workerSeen).toEqual([]);
 
-      // Without the session's own credential the endpoint is ignored: the worker's
-      // key never goes to an address a client named.
-      await callOnce(resolve, undefined, sessionGateway, p.model);
+      // Without the session's own access, the worker's key goes only to the worker's endpoint.
+      await callOnce(resolve, undefined, undefined, p.model);
       expect(sessionSeen).toHaveLength(1);
       expect(workerSeen.map(p.workerKey)).toEqual([p.workerKeySent]);
     } finally {

@@ -49,8 +49,8 @@ interface AgentSession {
   router: McpToolRouter;
   /** Everything the session has said and done, oldest first. */
   history: LanguageModelV4Message[];
-  /** How the session's model calls authenticate. */
-  access: ModelAccess;
+  /** The session's own model access; absent, the worker's key and endpoint. */
+  access?: ModelAccess;
   turn?: AbortController;
 }
 
@@ -107,9 +107,14 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         settings,
         router,
         history: history ? decodeMessages(history) : [],
-        access: modelCredential
-          ? { credential: modelCredential, ...(modelEndpoint ? { endpoint: modelEndpoint } : {}) }
-          : {},
+        ...(modelCredential
+          ? {
+              access: {
+                credential: modelCredential,
+                ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
+              },
+            }
+          : {}),
       });
       return { sessionId };
     })
