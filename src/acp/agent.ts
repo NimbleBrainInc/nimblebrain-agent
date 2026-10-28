@@ -42,15 +42,15 @@ import {
   USAGE_META_KEY,
 } from "./session-options.ts";
 
-export const AGENT_VERSION = "0.4.0";
+export const AGENT_VERSION = "0.5.0";
 
 interface AgentSession {
   settings: SessionSettings;
   router: McpToolRouter;
   /** Everything the session has said and done, oldest first. */
   history: LanguageModelV4Message[];
-  /** How the session's model calls authenticate. */
-  access: ModelAccess;
+  /** The session's own model access; absent, the worker's key and endpoint. */
+  access?: ModelAccess;
   turn?: AbortController;
 }
 
@@ -91,7 +91,13 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       if (opts.lifecycle && !opts.lifecycle.admit()) {
         throw acp.RequestError.internalError(undefined, "the agent is draining");
       }
-      const { history, modelCredential, ...overrides } = sent;
+      const { history, modelCredential, modelEndpoint, ...overrides } = sent;
+      if (modelEndpoint && !modelCredential) {
+        throw acp.RequestError.invalidParams(
+          undefined,
+          "modelEndpoint needs the session's own modelCredential",
+        );
+      }
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
       const router = await connectMcpToolRouter(
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
@@ -101,7 +107,14 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         settings,
         router,
         history: history ? decodeMessages(history) : [],
-        access: modelCredential ? { credential: modelCredential } : {},
+        ...(modelCredential
+          ? {
+              access: {
+                credential: modelCredential,
+                ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
+              },
+            }
+          : {}),
       });
       return { sessionId };
     })

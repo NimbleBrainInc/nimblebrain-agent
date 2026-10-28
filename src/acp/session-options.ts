@@ -17,6 +17,7 @@
  *     thinking?: ResolvedThinking,
  *     compaction?: false | { model?: string },  // mid-turn fold: off, or its summarizer model
  *     modelCredential?: string,  // bearer the session's model calls present instead of the worker's key
+ *     modelEndpoint?: string,    // base URL for those calls (a model gateway); only with modelCredential
  *   } }
  *
  * A `session/prompt` response carries nimblebrain-agent's own stop reason under
@@ -81,6 +82,12 @@ export type SessionOptions = Partial<SessionSettings> & {
    * memory for the session's life and never logged.
    */
   modelCredential?: string;
+  /**
+   * The base URL the session's model calls go to: a model gateway. Taken only
+   * with {@link modelCredential}; a session without its own credential uses the
+   * worker's endpoint and key, so a client never redirects the worker's key.
+   */
+  modelEndpoint?: string;
 };
 
 const BYTES_TAG = "__nb_agent_bytes";
