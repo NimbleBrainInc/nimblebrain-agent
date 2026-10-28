@@ -19,7 +19,7 @@ import type { LanguageModelV4, LanguageModelV4Message } from "@ai-sdk/provider";
 import { contextHooks, type TurnContext } from "../context/hooks.ts";
 import { AgentEngine } from "../engine/engine.ts";
 import type { EngineConfig, EngineEvent, EventSink } from "../engine/types.ts";
-import type { ModelResolver } from "../model/resolve.ts";
+import type { ModelAccess, ModelResolver } from "../model/resolve.ts";
 import { log } from "../observability/log.ts";
 import { addUsage, type TokenUsage } from "../usage/types.ts";
 import { acpMcpTransport } from "./acp-mcp-transport.ts";
@@ -42,13 +42,15 @@ import {
   USAGE_META_KEY,
 } from "./session-options.ts";
 
-export const AGENT_VERSION = "0.3.0";
+export const AGENT_VERSION = "0.4.0";
 
 interface AgentSession {
   settings: SessionSettings;
   router: McpToolRouter;
   /** Everything the session has said and done, oldest first. */
   history: LanguageModelV4Message[];
+  /** How the session's model calls authenticate. */
+  access: ModelAccess;
   turn?: AbortController;
 }
 
@@ -56,6 +58,18 @@ export interface AgentOptions {
   resolveModel: ModelResolver;
   /** What a session runs with where the client's options say nothing. */
   defaults: SessionSettings;
+  /**
+   * The serving process's say in a session's life: whether a new session may
+   * open (not while the process drains), and each turn's start and end, so it
+   * can wait for the turns in flight before it stops.
+   */
+  lifecycle?: AgentLifecycle;
+}
+
+export interface AgentLifecycle {
+  admit(): boolean;
+  turnStarted(): void;
+  turnEnded(): void;
 }
 
 export function createAgent(opts: AgentOptions): acp.AgentApp {
@@ -74,7 +88,10 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
     }))
     .onRequest(acp.methods.agent.session.new, async (ctx) => {
       const sent = (ctx.params._meta?.[SESSION_META_KEY] ?? {}) as SessionOptions;
-      const { history, ...overrides } = sent;
+      if (opts.lifecycle && !opts.lifecycle.admit()) {
+        throw acp.RequestError.internalError(undefined, "the agent is draining");
+      }
+      const { history, modelCredential, ...overrides } = sent;
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
       const router = await connectMcpToolRouter(
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
@@ -84,6 +101,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         settings,
         router,
         history: history ? decodeMessages(history) : [],
+        access: modelCredential ? { credential: modelCredential } : {},
       });
       return { sessionId };
     })
@@ -108,7 +126,8 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       };
       const { settings } = session;
       const tools = await session.router.availableTools();
-      const languageModel = opts.resolveModel(settings.model);
+      const resolve = (model: string) => opts.resolveModel(model, session.access);
+      const languageModel = resolve(settings.model);
       const config: EngineConfig = {
         ...engineConfigOf(settings, turn.signal),
         hooks: contextHooks({
@@ -117,12 +136,13 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
           tools,
           maxInputTokens: settings.maxInputTokens,
           maxOutputTokens: settings.maxOutputTokens,
-          summarizer: summarizerOf(settings, languageModel, opts.resolveModel, (model, usage) =>
+          summarizer: summarizerOf(settings, languageModel, resolve, (model, usage) =>
             calls.push({ model, purpose: "summary", usage }),
           ),
         }),
       };
       const engine = new AgentEngine(languageModel, session.router, sink);
+      opts.lifecycle?.turnStarted();
       try {
         const result = await engine.run(config, settings.system, [...session.history], tools);
         await updates.drained();
@@ -138,6 +158,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         throw err;
       } finally {
         if (session.turn === turn) session.turn = undefined;
+        opts.lifecycle?.turnEnded();
       }
     })
     .onNotification(acp.methods.agent.session.cancel, (ctx) => {
@@ -176,7 +197,7 @@ function engineConfigOf(settings: SessionSettings, signal: AbortSignal): EngineC
 function summarizerOf(
   settings: SessionSettings,
   languageModel: LanguageModelV4,
-  resolveModel: ModelResolver,
+  resolveModel: (model: string) => LanguageModelV4,
   onUsage: (model: string, usage: TokenUsage) => void,
 ): TurnContext["summarizer"] {
   if (settings.compaction === false) return undefined;
