@@ -27,9 +27,11 @@ function startGateway(seen: Headers[]) {
 
 async function callOnce(resolve: ReturnType<typeof createModelResolver>, credential?: string) {
   const model = resolve("anthropic:claude-sonnet-4-6", credential ? { credential } : undefined);
-  await model
-    .doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })
-    .catch(() => {});
+  try {
+    await model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] });
+  } catch {
+    // The gateway refuses every call; the test reads the request it saw.
+  }
 }
 
 test("anthropic: a session credential is the bearer, and the worker's key is not sent", async () => {
