@@ -89,7 +89,8 @@ is optional; what is left out comes from the defaults above.
     "maxOutputTokens": 8192,
     "thinking": { "mode": "effort", "effort": "medium", "source": "config" },
     "compaction": { "model": "anthropic:claude-haiku-4-5" },  // or false: never fold
-    "modelCredential": "…"      // a bearer the session's model calls present instead of the key
+    "modelCredential": "…",     // a bearer the session's model calls present instead of the key
+    "modelEndpoint": "https://…"  // where those calls go (a model gateway); only with modelCredential
   }
 }
 ```
@@ -97,6 +98,8 @@ is optional; what is left out comes from the defaults above.
 `modelCredential` is for a host whose model gateway issues a credential per turn: the session's
 calls send it as `Authorization: Bearer` to `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, in place of
 the worker's provider key. It is held in memory for the session's life and never logged.
+`modelEndpoint` sends those calls to that base URL instead of the worker's; it is refused without
+`modelCredential`, so a client can never send the worker's own key to an address it chose.
 
 `history` is a JSON array of [AI SDK](https://ai-sdk.dev) `LanguageModelV4Message`s, with a file
 part's bytes written as `{ "__nb_agent_bytes": "<base64>" }`. The turn's own message is the

@@ -14,12 +14,17 @@ import { defaultSettingsMiddleware, wrapLanguageModel } from "ai";
 import { wrapFetchWithLiveness } from "./fetch-liveness.ts";
 
 /**
- * How a session's model calls authenticate. `credential` is a bearer the
- * client handed the session (a gateway's per-turn credential), presented in
- * place of the process's provider key; absent, the provider key is used.
+ * How a session's model calls authenticate, and where they go. `credential`
+ * is a bearer the client handed the session (a gateway's per-turn
+ * credential), presented in place of the process's provider key; absent, the
+ * provider key is used. `endpoint` is the base URL the session's calls go to,
+ * in place of the process's; it is taken only beside a credential of the
+ * session's own, so a client can never send the process's key to an address
+ * it chose.
  */
 export interface ModelAccess {
   credential?: string;
+  endpoint?: string;
 }
 
 export type ModelResolver = (model: string, access?: ModelAccess) => LanguageModelV4;
@@ -30,7 +35,7 @@ export function createModelResolver(env: Env = process.env): ModelResolver {
   const cache = new Map<string, LanguageModelV4>();
   return (model, access) => {
     // A session's own credential is never cached: it lives as long as the session.
-    if (access?.credential) return resolveModel(model, env, access.credential);
+    if (access?.credential) return resolveModel(model, env, access);
     const cached = cache.get(model);
     if (cached) return cached;
     const resolved = resolveModel(model, env);
@@ -39,7 +44,9 @@ export function createModelResolver(env: Env = process.env): ModelResolver {
   };
 }
 
-function resolveModel(model: string, env: Env, credential?: string): LanguageModelV4 {
+function resolveModel(model: string, env: Env, access: ModelAccess = {}): LanguageModelV4 {
+  const { credential } = access;
+  const endpoint = credential ? access.endpoint : undefined;
   const separator = model.indexOf(":");
   if (separator < 0)
     throw new Error(`Model "${model}" names no provider (expected provider:model)`);
@@ -52,7 +59,9 @@ function resolveModel(model: string, env: Env, credential?: string): LanguageMod
         ...(credential
           ? { authToken: credential }
           : { apiKey: required(env, "ANTHROPIC_API_KEY") }),
-        ...(env.ANTHROPIC_BASE_URL ? { baseURL: env.ANTHROPIC_BASE_URL } : {}),
+        ...((endpoint ?? env.ANTHROPIC_BASE_URL)
+          ? { baseURL: endpoint ?? env.ANTHROPIC_BASE_URL }
+          : {}),
         // Re-arms the stream watchdog on Anthropic's keep-alive pings (fetch-liveness.ts).
         fetch: wrapFetchWithLiveness(globalThis.fetch) as typeof fetch,
       });
@@ -67,7 +76,7 @@ function resolveModel(model: string, env: Env, credential?: string): LanguageMod
     case "openai":
       return createOpenAI({
         apiKey: credential ?? required(env, "OPENAI_API_KEY"),
-        ...(env.OPENAI_BASE_URL ? { baseURL: env.OPENAI_BASE_URL } : {}),
+        ...((endpoint ?? env.OPENAI_BASE_URL) ? { baseURL: endpoint ?? env.OPENAI_BASE_URL } : {}),
       }).languageModel(modelId);
     default:
       throw new Error(`nimblebrain-agent has no provider "${provider}" (anthropic, openai)`);

@@ -42,7 +42,7 @@ import {
   USAGE_META_KEY,
 } from "./session-options.ts";
 
-export const AGENT_VERSION = "0.4.0";
+export const AGENT_VERSION = "0.5.0";
 
 interface AgentSession {
   settings: SessionSettings;
@@ -91,7 +91,13 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       if (opts.lifecycle && !opts.lifecycle.admit()) {
         throw acp.RequestError.internalError(undefined, "the agent is draining");
       }
-      const { history, modelCredential, ...overrides } = sent;
+      const { history, modelCredential, modelEndpoint, ...overrides } = sent;
+      if (modelEndpoint && !modelCredential) {
+        throw acp.RequestError.invalidParams(
+          undefined,
+          "modelEndpoint needs the session's own modelCredential",
+        );
+      }
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
       const router = await connectMcpToolRouter(
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
@@ -101,7 +107,9 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         settings,
         router,
         history: history ? decodeMessages(history) : [],
-        access: modelCredential ? { credential: modelCredential } : {},
+        access: modelCredential
+          ? { credential: modelCredential, ...(modelEndpoint ? { endpoint: modelEndpoint } : {}) }
+          : {},
       });
       return { sessionId };
     })

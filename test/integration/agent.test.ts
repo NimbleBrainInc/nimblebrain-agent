@@ -447,3 +447,12 @@ describe("the agent with tools on the ACP connection", () => {
     connection.close();
   });
 });
+
+describe("the agent's model endpoint option", () => {
+  test("is refused without the session's own model credential", async () => {
+    const { model } = recording([{ text: "ok" }]);
+    await expect(
+      session(model, { [SESSION_META_KEY]: { modelEndpoint: "https://elsewhere.example/v1" } }),
+    ).rejects.toThrow(/modelEndpoint needs the session's own modelCredential/);
+  });
+});

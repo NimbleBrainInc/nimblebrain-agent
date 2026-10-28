@@ -25,8 +25,15 @@ function startGateway(seen: Headers[]) {
   return `http://127.0.0.1:${gateway.port}/v1`;
 }
 
-async function callOnce(resolve: ReturnType<typeof createModelResolver>, credential?: string) {
-  const model = resolve("anthropic:claude-sonnet-4-6", credential ? { credential } : undefined);
+async function callOnce(
+  resolve: ReturnType<typeof createModelResolver>,
+  credential?: string,
+  endpoint?: string,
+) {
+  const model = resolve(
+    "anthropic:claude-sonnet-4-6",
+    credential || endpoint ? { credential, endpoint } : undefined,
+  );
   try {
     await model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] });
   } catch {
@@ -53,4 +60,39 @@ test("a session credential needs no provider key in the environment", async () =
   const resolve = createModelResolver({ ANTHROPIC_BASE_URL: startGateway(seen) });
   await callOnce(resolve, "turn-jwt");
   expect(seen[0]?.get("authorization")).toBe("Bearer turn-jwt");
+});
+
+test("a session endpoint takes the session's calls, but only beside its own credential", async () => {
+  const workerSeen: Headers[] = [];
+  const workerGateway = startGateway(workerSeen);
+  const sessionSeen: Headers[] = [];
+  const sessionGatewayServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      sessionSeen.push(req.headers);
+      return Response.json(
+        { error: { type: "authentication_error", message: "no" } },
+        { status: 401 },
+      );
+    },
+  });
+  const sessionGateway = `http://127.0.0.1:${sessionGatewayServer.port}/v1`;
+  try {
+    const resolve = createModelResolver({
+      ANTHROPIC_API_KEY: "worker-key",
+      ANTHROPIC_BASE_URL: workerGateway,
+    });
+    await callOnce(resolve, "turn-jwt", sessionGateway);
+    expect(sessionSeen.map((h) => h.get("authorization"))).toEqual(["Bearer turn-jwt"]);
+    expect(workerSeen).toEqual([]);
+
+    // Without the session's own credential the endpoint is ignored: the worker's
+    // key never goes to an address a client named.
+    await callOnce(resolve, undefined, sessionGateway);
+    expect(sessionSeen).toHaveLength(1);
+    expect(workerSeen.map((h) => h.get("x-api-key"))).toEqual(["worker-key"]);
+  } finally {
+    await sessionGatewayServer.stop(true);
+  }
 });
