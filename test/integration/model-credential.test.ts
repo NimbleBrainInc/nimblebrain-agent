@@ -182,3 +182,54 @@ test("a call goes to its provider's own endpoint, ahead of the session's one end
     await ownServer.stop(true);
   }
 });
+
+// The OpenAI-compatible providers ask for streamed usage (else every call meters
+// at zero) and send a response format's schema as given.
+for (const model of ["nebius:Qwen/Qwen3-235B-A22B-Instruct-2507", "greenpt:gpt-oss-120b"]) {
+  test(`${model.split(":")[0]}: a streamed call asks for usage, keeps the schema, and reads the usage back`, async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const chunk = (data: unknown) => `data: ${JSON.stringify(data)}\n\n`;
+    const base = { id: "c1", object: "chat.completion.chunk", created: 0, model: "m" };
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        bodies.push((await req.json()) as Record<string, unknown>);
+        const sse =
+          chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: "{}" } }] }) +
+          chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+          chunk({ ...base, choices: [], usage: { prompt_tokens: 11, completion_tokens: 7 } }) +
+          "data: [DONE]\n\n";
+        return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    try {
+      const schema = {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+      } as const;
+      const resolve = createModelResolver({});
+      const { stream } = await resolve(model, {
+        credential: "turn-jwt",
+        endpoint: `http://127.0.0.1:${server.port}/v1`,
+      }).doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        responseFormat: { type: "json", schema, name: "reply" },
+      });
+      const parts: { type: string; usage?: unknown }[] = [];
+      for await (const part of stream) parts.push(part);
+
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]?.stream_options).toEqual({ include_usage: true });
+      expect(bodies[0]?.response_format).toMatchObject({
+        type: "json_schema",
+        json_schema: { name: "reply", schema },
+      });
+      const finish = parts.find((p) => p.type === "finish");
+      expect(finish?.usage).toMatchObject({ inputTokens: { total: 11 }, outputTokens: { total: 7 } });
+    } finally {
+      await server.stop(true);
+    }
+  });
+}
