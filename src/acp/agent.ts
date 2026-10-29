@@ -189,10 +189,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
           log.info("[acp] turn ended", { ...turnFields(), stop_reason: "cancelled" });
           return { stopReason: "cancelled" as const };
         }
-        log.warn("[acp] turn failed", {
-          ...turnFields(),
-          error: err instanceof Error ? err.message : String(err),
-        });
+        log.warn("[acp] turn failed", { ...turnFields(), ...failureOf(err) });
         throw err;
       } finally {
         if (session.turn === turn) session.turn = undefined;
@@ -242,6 +239,19 @@ function logSessionOpened(
     history_messages: opened.historyMessages,
     ...(opened.modelEndpoint ? { model_endpoint_host: hostOf(opened.modelEndpoint) } : {}),
   });
+}
+
+/**
+ * What a failed turn logs of its error: the error's class and, when it carries one, its HTTP
+ * status. Never the message: a provider's error text can echo the request's credential.
+ */
+function failureOf(err: unknown): { error: string; status?: number } {
+  const { status, statusCode } = (err ?? {}) as { status?: unknown; statusCode?: unknown };
+  const code = typeof status === "number" ? status : statusCode;
+  return {
+    error: err instanceof Error ? err.name : typeof err,
+    ...(typeof code === "number" ? { status: code } : {}),
+  };
 }
 
 /** A URL's host for a log line, never its path or query. */
