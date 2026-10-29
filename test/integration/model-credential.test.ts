@@ -76,6 +76,34 @@ const providers = [
     workerKey: (h: Headers) => h.get("authorization"),
     workerKeySent: "Bearer worker-key",
   },
+  {
+    model: "google:gemini-3-pro",
+    keyVar: "GOOGLE_GENERATIVE_AI_API_KEY",
+    baseVar: "GOOGLE_GENERATIVE_AI_BASE_URL",
+    workerKey: (h: Headers) => h.get("x-goog-api-key"),
+    workerKeySent: "worker-key",
+  },
+  {
+    model: "xai:grok-4",
+    keyVar: "XAI_API_KEY",
+    baseVar: "XAI_BASE_URL",
+    workerKey: (h: Headers) => h.get("authorization"),
+    workerKeySent: "Bearer worker-key",
+  },
+  {
+    model: "nebius:Qwen/Qwen3-235B-A22B-Instruct-2507",
+    keyVar: "NEBIUS_API_KEY",
+    baseVar: "NEBIUS_BASE_URL",
+    workerKey: (h: Headers) => h.get("authorization"),
+    workerKeySent: "Bearer worker-key",
+  },
+  {
+    model: "greenpt:gpt-oss-120b",
+    keyVar: "GREENPT_API_KEY",
+    baseVar: "GREENPT_BASE_URL",
+    workerKey: (h: Headers) => h.get("authorization"),
+    workerKeySent: "Bearer worker-key",
+  },
 ];
 
 for (const p of providers) {
@@ -102,6 +130,10 @@ for (const p of providers) {
       });
       await callOnce(resolve, "turn-jwt", sessionGateway, p.model);
       expect(sessionSeen.map((h) => h.get("authorization"))).toEqual(["Bearer turn-jwt"]);
+      // No header a provider key travels in reaches the session's endpoint.
+      expect(sessionSeen.map((h) => [h.get("x-api-key"), h.get("x-goog-api-key")])).toEqual([
+        [null, null],
+      ]);
       expect(workerSeen).toEqual([]);
 
       // Without the session's own access, the worker's key goes only to the worker's endpoint.
@@ -113,3 +145,40 @@ for (const p of providers) {
     }
   });
 }
+
+test("a call goes to its provider's own endpoint, ahead of the session's one endpoint", async () => {
+  const shared: string[] = [];
+  const own: string[] = [];
+  const serve = (paths: string[]) =>
+    Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        paths.push(new URL(req.url).pathname);
+        return Response.json({ error: { message: "no" } }, { status: 401 });
+      },
+    });
+  const sharedServer = serve(shared);
+  const ownServer = serve(own);
+  try {
+    const resolve = createModelResolver({});
+    const access = {
+      credential: "turn-jwt",
+      endpoint: `http://127.0.0.1:${sharedServer.port}/v1`,
+      endpoints: { google: `http://127.0.0.1:${ownServer.port}/google/v1beta` },
+    };
+    const prompt = [{ role: "user" as const, content: [{ type: "text" as const, text: "hi" }] }];
+    for (const model of ["google:gemini-3-pro", "anthropic:claude-sonnet-4-6"]) {
+      try {
+        await resolve(model, access).doGenerate({ prompt });
+      } catch {
+        // Both refuse; the test reads where each call went.
+      }
+    }
+    expect(own).toEqual(["/google/v1beta/models/gemini-3-pro:generateContent"]);
+    expect(shared).toEqual(["/v1/messages"]);
+  } finally {
+    await sharedServer.stop(true);
+    await ownServer.stop(true);
+  }
+});

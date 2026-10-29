@@ -16,8 +16,11 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "2.0.2",
     "@ai-sdk/anthropic": "4.0.57",
+    "@ai-sdk/google": "4.0.75",
     "@ai-sdk/openai": "4.0.70",
+    "@ai-sdk/openai-compatible": "3.0.62",
     "@ai-sdk/provider": "4.0.17",
+    "@ai-sdk/xai": "4.0.59",
     "@modelcontextprotocol/client": "2.3.0",
     "@modelcontextprotocol/core": "2.3.0",
     "@modelcontextprotocol/ext-apps": "2.0.0",

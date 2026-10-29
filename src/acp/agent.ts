@@ -91,13 +91,8 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       if (opts.lifecycle && !opts.lifecycle.admit()) {
         throw acp.RequestError.internalError(undefined, "the agent is draining");
       }
-      const { history, modelCredential, modelEndpoint, ...overrides } = sent;
-      if (modelEndpoint && !modelCredential) {
-        throw acp.RequestError.invalidParams(
-          undefined,
-          "modelEndpoint needs the session's own modelCredential",
-        );
-      }
+      const { history, modelCredential, modelEndpoint, modelEndpoints, ...overrides } = sent;
+      const access = sessionAccess({ modelCredential, modelEndpoint, modelEndpoints });
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
       const router = await connectMcpToolRouter(
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
@@ -107,20 +102,13 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       logSessionOpened(sessionId, settings, {
         mcpServers: ctx.params.mcpServers.length,
         historyMessages: prior.length,
-        modelEndpoint,
+        modelEndpoint: access?.endpoints?.[providerOf(settings.model)] ?? access?.endpoint,
       });
       sessions.set(sessionId, {
         settings,
         router,
         history: prior,
-        ...(modelCredential
-          ? {
-              access: {
-                credential: modelCredential,
-                ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
-              },
-            }
-          : {}),
+        ...(access ? { access } : {}),
       });
       return { sessionId };
     })
@@ -223,9 +211,9 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
 
 /**
  * The line a new session logs. The session id is what a client records for the
- * session (the NimbleBrain runtime as `runtimeSessionId`), so it joins this
- * worker's lines to the client's run. The credential is never logged; the
- * endpoint's host is.
+ * session (a host keeps it per run), so it joins this worker's lines to the
+ * client's run. The credential is never logged; the host the session model's
+ * calls go to is.
  */
 function logSessionOpened(
   sessionId: string,
@@ -252,6 +240,35 @@ function failureOf(err: unknown): { error: string; status?: number } {
     error: err instanceof Error ? err.name : typeof err,
     ...(typeof code === "number" ? { status: code } : {}),
   };
+}
+
+/**
+ * The session's own access to its models, from its options: its credential,
+ * with the endpoints its calls go to. An endpoint without the credential is
+ * refused, so a client can never send the worker's key to an address it chose.
+ */
+function sessionAccess(
+  sent: Pick<SessionOptions, "modelCredential" | "modelEndpoint" | "modelEndpoints">,
+): ModelAccess | undefined {
+  const { modelCredential, modelEndpoint, modelEndpoints } = sent;
+  if ((modelEndpoint || modelEndpoints) && !modelCredential) {
+    throw acp.RequestError.invalidParams(
+      undefined,
+      "modelEndpoint and modelEndpoints need the session's own modelCredential",
+    );
+  }
+  if (!modelCredential) return undefined;
+  return {
+    credential: modelCredential,
+    ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
+    ...(modelEndpoints ? { endpoints: modelEndpoints } : {}),
+  };
+}
+
+/** The provider half of a `provider:model` string, empty when it names none. */
+function providerOf(model: string): string {
+  const separator = model.indexOf(":");
+  return separator < 0 ? "" : model.slice(0, separator);
 }
 
 /** A URL's host for a log line, never its path or query. */
