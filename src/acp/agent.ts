@@ -103,10 +103,16 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
       );
       const sessionId = crypto.randomUUID();
+      const prior = history ? decodeMessages(history) : [];
+      logSessionOpened(sessionId, settings, {
+        mcpServers: ctx.params.mcpServers.length,
+        historyMessages: prior.length,
+        modelEndpoint,
+      });
       sessions.set(sessionId, {
         settings,
         router,
-        history: history ? decodeMessages(history) : [],
+        history: prior,
         ...(modelCredential
           ? {
               access: {
@@ -155,11 +161,23 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         }),
       };
       const engine = new AgentEngine(languageModel, session.router, sink);
+      const started = performance.now();
+      const turnFields = () => ({
+        session_id: ctx.params.sessionId,
+        model_calls: calls.length,
+        duration_ms: Math.round(performance.now() - started),
+      });
       opts.lifecycle?.turnStarted();
       try {
         const result = await engine.run(config, settings.system, [...session.history], tools);
         await updates.drained();
         const usage = turnUsage(calls);
+        log.info("[acp] turn ended", {
+          ...turnFields(),
+          stop_reason: result.stopReason,
+          input_tokens: usage.total.inputTokens,
+          output_tokens: usage.total.outputTokens,
+        });
         return {
           stopReason: toAcpStopReason(result.stopReason),
           usage: acpUsage(usage.total),
@@ -167,7 +185,14 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         };
       } catch (err) {
         await updates.drained();
-        if (turn.signal.aborted) return { stopReason: "cancelled" as const };
+        if (turn.signal.aborted) {
+          log.info("[acp] turn ended", { ...turnFields(), stop_reason: "cancelled" });
+          return { stopReason: "cancelled" as const };
+        }
+        log.warn("[acp] turn failed", {
+          ...turnFields(),
+          error: err instanceof Error ? err.message : String(err),
+        });
         throw err;
       } finally {
         if (session.turn === turn) session.turn = undefined;
@@ -180,12 +205,16 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
     .onRequest(acp.methods.agent.session.close, async (ctx) => {
       const session = sessions.get(ctx.params.sessionId);
       sessions.delete(ctx.params.sessionId);
+      if (session) log.info("[acp] session closed", { session_id: ctx.params.sessionId });
       session?.turn?.abort();
       await session?.router.close();
       return {};
     })
     .onConnect((connection) => {
       void connection.closed.then(async () => {
+        if (sessions.size > 0) {
+          log.info("[acp] connection closed", { open_sessions: [...sessions.keys()] });
+        }
         for (const session of sessions.values()) {
           session.turn?.abort();
           await session.router.close();
@@ -193,6 +222,35 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         sessions.clear();
       });
     });
+}
+
+/**
+ * The line a new session logs. The session id is what a client records for the
+ * session (the NimbleBrain runtime as `runtimeSessionId`), so it joins this
+ * worker's lines to the client's run. The credential is never logged; the
+ * endpoint's host is.
+ */
+function logSessionOpened(
+  sessionId: string,
+  settings: SessionSettings,
+  opened: { mcpServers: number; historyMessages: number; modelEndpoint?: string },
+): void {
+  log.info("[acp] session opened", {
+    session_id: sessionId,
+    model: settings.model,
+    mcp_servers: opened.mcpServers,
+    history_messages: opened.historyMessages,
+    ...(opened.modelEndpoint ? { model_endpoint_host: hostOf(opened.modelEndpoint) } : {}),
+  });
+}
+
+/** A URL's host for a log line, never its path or query. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "(unparsed)";
+  }
 }
 
 function engineConfigOf(settings: SessionSettings, signal: AbortSignal): EngineConfig {
