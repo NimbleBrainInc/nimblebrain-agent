@@ -18,6 +18,7 @@
  *     compaction?: false | { model?: string },  // mid-turn fold: off, or its summarizer model
  *     modelCredential?: string,  // bearer the session's model calls present instead of the worker's key
  *     modelEndpoint?: string,    // base URL for those calls (a model gateway); only with modelCredential
+ *     modelEndpoints?: Record<string, string>,  // a base URL per provider, ahead of modelEndpoint; only with modelCredential
  *   } }
  *
  * A `session/prompt` response carries nimblebrain-agent's own stop reason under
@@ -88,6 +89,12 @@ export type SessionOptions = Partial<SessionSettings> & {
    * worker's endpoint and key, so a client never redirects the worker's key.
    */
   modelEndpoint?: string;
+  /**
+   * A base URL per provider (`anthropic`, `google`, ...), for a gateway that
+   * serves each provider at its own address. A call goes to its provider's entry,
+   * else to {@link modelEndpoint}. Refused without {@link modelCredential}.
+   */
+  modelEndpoints?: Record<string, string>;
 };
 
 const BYTES_TAG = "__nb_agent_bytes";

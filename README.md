@@ -21,13 +21,13 @@ Point an ACP client at that command. A session runs on these defaults:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NB_AGENT_MODEL` | `provider:model` (`anthropic:…`, `openai:…`) | `anthropic:claude-sonnet-4-6` |
+| `NB_AGENT_MODEL` | `provider:model`: `anthropic`, `openai`, `google`, `xai`, `nebius` or `greenpt` | `anthropic:claude-sonnet-4-6` |
 | `NB_AGENT_SYSTEM_PROMPT` | The system prompt | a short general one |
 | `NB_AGENT_MAX_ITERATIONS` | Loop iterations per turn (at most 50) | 25 |
 | `NB_AGENT_MAX_INPUT_TOKENS` | Input-token cap per model call | 500000 |
 | `NB_AGENT_MAX_OUTPUT_TOKENS` | Output-token cap per model call | the model's own limit |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | The provider key | none |
-| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | Send model calls to a gateway instead | the provider's |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `XAI_API_KEY`, `NEBIUS_API_KEY`, `GREENPT_API_KEY` | The provider's key | none |
+| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_BASE_URL`, `XAI_BASE_URL`, `NEBIUS_BASE_URL`, `GREENPT_BASE_URL` | Send that provider's calls to a gateway instead | the provider's |
 
 ### As a worker
 
@@ -106,15 +106,18 @@ is optional; what is left out comes from the defaults above.
     "thinking": { "mode": "effort", "effort": "medium", "source": "config" },
     "compaction": { "model": "anthropic:claude-haiku-4-5" },  // or false: never fold
     "modelCredential": "…",     // a bearer the session's model calls present instead of the key
-    "modelEndpoint": "https://…"  // where those calls go (a model gateway); only with modelCredential
+    "modelEndpoint": "https://…",  // where those calls go (a model gateway); only with modelCredential
+    "modelEndpoints": { "google": "https://…/google/v1beta" }  // per provider, ahead of modelEndpoint
   }
 }
 ```
 
 `modelCredential` is for a host whose model gateway issues a credential per turn: the session's
-calls send it as `Authorization: Bearer` to `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, in place of
-the worker's provider key. It is held in memory for the session's life and never logged.
-`modelEndpoint` sends those calls to that base URL instead of the worker's; it is refused without
+calls send it as `Authorization: Bearer`, whichever provider they are for, in place of the worker's
+provider key, and no provider key header goes with them. It is held in memory for the session's life
+and never logged. `modelEndpoint` sends those calls to that base URL instead of the worker's;
+`modelEndpoints` names a base URL per provider, for a gateway that serves each provider at its own
+address, and a call goes to its provider's entry ahead of `modelEndpoint`. Both are refused without
 `modelCredential`, so a client can never send the worker's own key to an address it chose.
 
 `history` is a JSON array of [AI SDK](https://ai-sdk.dev) `LanguageModelV4Message`s, with a file

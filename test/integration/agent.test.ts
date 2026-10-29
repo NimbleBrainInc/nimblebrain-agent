@@ -455,7 +455,29 @@ describe("the agent's model endpoint option", () => {
     const { model } = recording([{ text: "ok" }]);
     await expect(
       session(model, { [SESSION_META_KEY]: { modelEndpoint: "https://elsewhere.example/v1" } }),
-    ).rejects.toThrow(/modelEndpoint needs the session's own modelCredential/);
+    ).rejects.toThrow(/modelEndpoint and modelEndpoints need the session's own modelCredential/);
+    await expect(
+      session(model, {
+        [SESSION_META_KEY]: { modelEndpoints: { anthropic: "https://elsewhere.example/v1" } },
+      }),
+    ).rejects.toThrow(/modelEndpoint and modelEndpoints need the session's own modelCredential/);
+  });
+
+  test("hands the resolver each provider's endpoint beside the credential", async () => {
+    const { model } = recording([{ text: "ok" }]);
+    const accesses: (ModelAccess | undefined)[] = [];
+    const endpoints = { anthropic: "https://gateway.example/anthropic/v1" };
+    const s = await session(
+      (_id, access) => {
+        accesses.push(access);
+        return model;
+      },
+      { [SESSION_META_KEY]: { modelCredential: "turn-jwt", modelEndpoints: endpoints } },
+    );
+    await s.prompt("hi");
+    expect(accesses.length).toBeGreaterThan(0);
+    for (const access of accesses) expect(access).toEqual({ credential: "turn-jwt", endpoints });
+    s.close();
   });
 
   test("reaches the model resolver beside the session's credential", async () => {
