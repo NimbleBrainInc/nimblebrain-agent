@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import type {
   LanguageModelV4,
@@ -16,6 +16,7 @@ import {
   USAGE_META_KEY,
 } from "../../src/acp/session-options.ts";
 import type { ModelAccess, ModelResolver } from "../../src/model/resolve.ts";
+import { log } from "../../src/observability/log.ts";
 import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
 import { type AcpStubMcp, acpStubMcp } from "../helpers/acp-stub-mcp.ts";
 import { type StubMcp, startStubMcp } from "../helpers/stub-mcp.ts";
@@ -477,5 +478,180 @@ describe("the agent's model endpoint option", () => {
     for (const access of accesses)
       expect(access).toEqual({ credential: "turn-jwt", endpoint: "https://gateway.example/v1" });
     s.close();
+  });
+});
+
+describe("the agent's log lines", () => {
+  test("name the session, its turn and its close, and never the credential", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => {});
+    try {
+      const { model } = recording([
+        { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
+        { text: "done" },
+      ]);
+      const s = await session(model, {
+        [SESSION_META_KEY]: {
+          modelCredential: "turn-jwt-secret",
+          modelEndpoint: "https://gateway.example/v1?k=v",
+        },
+      });
+      await s.prompt("hi");
+      await s.agent.request(acp.methods.agent.session.close, { sessionId: s.sessionId });
+      s.close();
+
+      const lines = info.mock.calls.map(([message, fields]) => ({ message, fields }));
+      const of = (message: string) => lines.filter((l) => l.message === message);
+      expect(of("[acp] session opened")).toEqual([
+        {
+          message: "[acp] session opened",
+          fields: {
+            session_id: s.sessionId,
+            model: DEFAULTS.model,
+            mcp_servers: 1,
+            history_messages: 0,
+            model_endpoint_host: "gateway.example",
+          },
+        },
+      ]);
+      const [ended] = of("[acp] turn ended");
+      expect(ended?.fields).toMatchObject({
+        session_id: s.sessionId,
+        stop_reason: "complete",
+        model_calls: 2,
+      });
+      expect(typeof (ended?.fields as { duration_ms?: unknown } | undefined)?.duration_ms).toBe(
+        "number",
+      );
+      expect(of("[acp] session closed")).toEqual([
+        { message: "[acp] session closed", fields: { session_id: s.sessionId } },
+      ]);
+      expect(JSON.stringify(info.mock.calls)).not.toContain("turn-jwt-secret");
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("count the host's history in messages", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => {});
+    try {
+      const { model } = recording([{ text: "ok" }]);
+      const s = await session(model, {
+        [SESSION_META_KEY]: {
+          history: encodeMessages([
+            { role: "user", content: [{ type: "text", text: "earlier question" }] },
+            { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+          ]),
+        },
+      });
+      s.close();
+      const opened = info.mock.calls.find(([message]) => message === "[acp] session opened");
+      expect(opened?.[1]).toMatchObject({ history_messages: 2 });
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("give a turn's token totals", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => {});
+    try {
+      const { model } = recording(
+        [{ text: "ok" }],
+        [
+          providerUsage({
+            noCache: 200,
+            cacheRead: 300,
+            cacheWrite: 500,
+            cacheWrite1h: 0,
+            output: 50,
+          }),
+        ],
+      );
+      const s = await session(model);
+      await s.prompt("hi");
+      s.close();
+      const ended = info.mock.calls.find(([message]) => message === "[acp] turn ended");
+      expect(ended?.[1]).toMatchObject({ input_tokens: 1_000, output_tokens: 50 });
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("end a cancelled turn as cancelled", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => {});
+    try {
+      mcp = startStubMcp(() => "late");
+      const { model } = recording([
+        { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
+        { text: "never" },
+      ]);
+      let cancel: (() => void) | undefined;
+      const s = await session(model, undefined, (u) => {
+        if (u.sessionUpdate === "tool_call") cancel?.();
+      });
+      cancel = () =>
+        void s.agent.notify(acp.methods.agent.session.cancel, { sessionId: s.sessionId });
+      await s.prompt("go");
+      s.close();
+      const ended = info.mock.calls.find(([message]) => message === "[acp] turn ended");
+      expect(ended?.[1]).toMatchObject({ session_id: s.sessionId, stop_reason: "cancelled" });
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("log a failed turn's error class and status, never its message", async () => {
+    const written: string[] = [];
+    const stderr = spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+    const format = process.env.NB_LOG_FORMAT;
+    process.env.NB_LOG_FORMAT = "json";
+    try {
+      const echo = createEchoModel({ responses: [{ text: "never" }] });
+      const rejected = () =>
+        Object.assign(new Error("Rejected credential turn-jwt-secret"), {
+          name: "AI_APICallError",
+          statusCode: 401,
+        });
+      const model: LanguageModelV4 = {
+        ...echo,
+        doStream: () => Promise.reject(rejected()),
+        doGenerate: () => Promise.reject(rejected()),
+      };
+      const s = await session(model, {
+        [SESSION_META_KEY]: { modelCredential: "turn-jwt-secret" },
+      });
+      await expect(s.prompt("hi")).rejects.toThrow();
+      s.close();
+      const failed = written
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((line) => line.message === "[acp] turn failed");
+      expect(failed).toHaveLength(1);
+      expect(failed[0]).toMatchObject({
+        session_id: s.sessionId,
+        error: "AI_APICallError",
+        status: 401,
+      });
+      expect(written.join("")).not.toContain("turn-jwt-secret");
+    } finally {
+      if (format === undefined) delete process.env.NB_LOG_FORMAT;
+      else process.env.NB_LOG_FORMAT = format;
+      stderr.mockRestore();
+    }
+  });
+
+  test("name the sessions still open when the connection drops", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => {});
+    try {
+      const { model } = recording([{ text: "ok" }]);
+      const s = await session(model);
+      s.close();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const closed = info.mock.calls.find(([message]) => message === "[acp] connection closed");
+      expect(closed?.[1]).toEqual({ open_sessions: [s.sessionId] });
+    } finally {
+      info.mockRestore();
+    }
   });
 });
