@@ -27,10 +27,12 @@
  *   NB_AGENT_PORT               port                   default 8080
  *   NB_AGENT_DRAIN_MS           longest drain wait     default 900000
  *   NB_AGENT_AUTH_JWKS_URL      the runtime's public key set, which connection credentials verify against
+ *   NB_AGENT_AUTH_JWKS_FILE     or a file holding that key set (exactly one of the two)
  *   NB_AGENT_AUTH_ISSUER        the issuer those credentials name (the runtime's public origin)
  *   NB_AGENT_AUTH=none          no connection check; refused unless NB_AGENT_HOST is loopback
  */
 
+import { existsSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import { createAgent, AGENT_VERSION } from "./acp/agent.ts";
@@ -95,14 +97,24 @@ const DEFAULT_DRAIN_MS = 15 * 60_000;
 /** The connection check `serve` runs, from the environment. */
 export function connectionAuthFrom(env: Env): ConnectionAuth | null {
   if (env.NB_AGENT_AUTH === "none") return null;
-  const jwksUrl = env.NB_AGENT_AUTH_JWKS_URL;
+  const jwksUrl = env.NB_AGENT_AUTH_JWKS_URL || undefined;
+  const jwksFile = env.NB_AGENT_AUTH_JWKS_FILE || undefined;
   const issuer = env.NB_AGENT_AUTH_ISSUER;
-  if (!jwksUrl || !issuer) {
+  if (jwksUrl && jwksFile) {
     throw new Error(
-      "serve needs NB_AGENT_AUTH_JWKS_URL and NB_AGENT_AUTH_ISSUER (or NB_AGENT_AUTH=none on loopback)",
+      "serve takes one of NB_AGENT_AUTH_JWKS_URL and NB_AGENT_AUTH_JWKS_FILE, not both",
     );
   }
-  return createConnectionAuth({ jwksUrl, issuer });
+  if (!(jwksUrl || jwksFile) || !issuer) {
+    throw new Error(
+      "serve needs NB_AGENT_AUTH_JWKS_URL (or NB_AGENT_AUTH_JWKS_FILE) and NB_AGENT_AUTH_ISSUER (or NB_AGENT_AUTH=none on loopback)",
+    );
+  }
+  // A file path is checked at start, so a wrong path fails the start rather than every request.
+  if (jwksFile && !existsSync(jwksFile)) {
+    throw new Error(`NB_AGENT_AUTH_JWKS_FILE ${jwksFile} does not exist`);
+  }
+  return createConnectionAuth({ jwksUrl, jwksFile, issuer });
 }
 
 /** Serve over HTTP until SIGTERM or SIGINT, then drain. */
