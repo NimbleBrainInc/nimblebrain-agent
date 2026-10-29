@@ -87,9 +87,12 @@ jobs:
 
       - name: Resolve version + source SHA
         id: r
+        # The tag reaches the script as data through env, never as shell source:
+        # a tag can carry `$(...)`, and the check below runs after it is read.
+        env:
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           # Require vX.Y.Z (optional -prerelease / +build). A garbage version would
           # burn an immutable tag, so reject it before anything is written.
           if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
@@ -140,7 +143,9 @@ jobs:
           tags: ${{ steps.rb.outputs.tags }}
       - name: Flag emergency rebuild
         if: ${{ github.event.inputs.rebuild == 'true' }}
-        run: echo "::warning::REBUILT the worker image for ${{ steps.r.outputs.version }} from source — NOT the image main built and tested. The release is not byte-for-byte."
+        env:
+          VERSION: ${{ steps.r.outputs.version }}
+        run: echo "::warning::REBUILT the worker image for $VERSION from source — NOT the image main built and tested. The release is not byte-for-byte."
 
       # ── Normal path: promote-by-retag ─────────────────────────────────────────
       # ECR: retag the :<sha> manifest -> :vX.Y.Z, with three guards (immutable repo /
