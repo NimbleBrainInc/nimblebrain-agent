@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type {
-  LanguageModelV4,
-  LanguageModelV4CallOptions,
-  LanguageModelV4StreamPart,
+import {
+  APICallError,
+  type LanguageModelV4,
+  type LanguageModelV4CallOptions,
+  type LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
 import { withRetry } from "../../src/engine/retry.ts";
 import { callModel, ModelStreamStallError, NO_FINISH_PART_RAW } from "../../src/model/stream.ts";
@@ -562,5 +563,89 @@ describe("callModel — raw finish reason", () => {
       () => {},
     );
     expect(result.finishReason).toEqual({ unified: "stop", raw: undefined });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A stream cut mid-read: retried only before output reached the client
+// ---------------------------------------------------------------------------
+
+/**
+ * The AI SDK's error for a response body that failed mid-read: status 200, and
+ * marked retryable because a network code sits in its cause.
+ */
+function connectionCut(): APICallError {
+  return new APICallError({
+    message: "Cannot connect to API: socket closed",
+    url: "https://provider.example/v1/messages",
+    requestBodyValues: {},
+    statusCode: 200,
+    isRetryable: true,
+  });
+}
+
+/**
+ * Emits `deltas` text deltas, then fails with `err` once they are read. Pulled,
+ * since `controller.error` discards parts still queued.
+ */
+function cutStream(deltas: string[], err: Error): ReadableStream<LanguageModelV4StreamPart> {
+  const parts: LanguageModelV4StreamPart[] = [
+    { type: "stream-start", warnings: [] },
+    ...(deltas.length > 0 ? [{ type: "text-start" as const, id: "t0" }] : []),
+    ...deltas.map((delta) => ({ type: "text-delta" as const, id: "t0", delta })),
+  ];
+  return new ReadableStream({
+    pull(controller) {
+      const part = parts.shift();
+      if (part) controller.enqueue(part);
+      else controller.error(err);
+    },
+  });
+}
+
+describe("callModel + withRetry — a stream cut mid-read", () => {
+  it("does not re-issue a call whose output already reached the client", async () => {
+    const cut = connectionCut();
+    let calls = 0;
+    const model = scriptedModel([
+      () => {
+        calls++;
+        return cutStream(["partial "], cut);
+      },
+      () => {
+        calls++;
+        return textStream("again");
+      },
+    ]);
+    const deltas: string[] = [];
+    const failed = await withRetry(
+      () => callModel(model, userPrompt("x"), (t) => deltas.push(t)),
+      3,
+      0,
+    ).catch((err: unknown) => err);
+
+    expect(calls).toBe(1);
+    expect(deltas).toEqual(["partial "]);
+    // The provider's error itself, its status kept for the turn's error.
+    expect(failed).toBe(cut);
+    expect((failed as APICallError).statusCode).toBe(200);
+  });
+
+  it("re-issues a call cut before any output", async () => {
+    let calls = 0;
+    const model = scriptedModel([
+      () => {
+        calls++;
+        return cutStream([], connectionCut());
+      },
+      () => {
+        calls++;
+        return textStream("recovered");
+      },
+    ]);
+    const result = await withRetry(() => callModel(model, userPrompt("x"), () => {}), 3, 0);
+
+    expect(calls).toBe(2);
+    expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
   });
 });

@@ -1,4 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { APICallError } from "@ai-sdk/provider";
 import { isRetryable, withRetry } from "../../src/engine/retry.ts";
 import { ModelStreamStallError } from "../../src/model/stream.ts";
 
@@ -22,8 +24,14 @@ describe("isRetryable", () => {
     expect(isRetryable(httpError(401))).toBe(false);
   });
 
-  it("returns false for 500", () => {
-    expect(isRetryable(httpError(500))).toBe(false);
+  it("returns true for a transient 5xx and 408", () => {
+    for (const status of [408, 500, 502, 503, 504])
+      expect(isRetryable(httpError(status))).toBe(true);
+  });
+
+  it("returns false for 400 and 404", () => {
+    expect(isRetryable(httpError(400))).toBe(false);
+    expect(isRetryable(httpError(404))).toBe(false);
   });
 
   it("returns false for plain Error (no status)", () => {
@@ -89,18 +97,19 @@ describe("withRetry", () => {
     expect(calls).toBe(2);
   });
 
-  it("fails immediately on 401 with clear message", async () => {
+  it("fails immediately on 401, rethrowing the error unchanged", async () => {
     let calls = 0;
+    const unauthorized = httpError(401);
     await expect(
       withRetry(
         async () => {
           calls++;
-          throw httpError(401);
+          throw unauthorized;
         },
         3,
         0,
       ),
-    ).rejects.toThrow("Authentication failed (401)");
+    ).rejects.toBe(unauthorized);
     expect(calls).toBe(1);
   });
 
@@ -349,5 +358,161 @@ describe("withRetry logging", () => {
     }
     // 3 retries logged; the 4th (terminal) failure rethrows without a retry line.
     expect(lines.filter((l) => l.includes("[engine] retry"))).toHaveLength(3);
+  });
+});
+
+/**
+ * A provider failure as the engine sees it: `model.doStream()` throws the AI
+ * SDK's `APICallError`, which carries the code in `statusCode` (never `status`)
+ * and the SDK's own verdict in `isRetryable`.
+ */
+function apiCallError(
+  statusCode: number | undefined,
+  responseBody: string,
+  contentType = "application/json",
+  isRetryable?: boolean,
+): APICallError {
+  return new APICallError({
+    message: "provider failed",
+    url: "https://provider.example/v1/messages",
+    requestBodyValues: {},
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    responseHeaders: { "content-type": contentType },
+    responseBody,
+    ...(isRetryable !== undefined ? { isRetryable } : {}),
+  });
+}
+
+/** The model gateway's answer to a call past the run's model budget. */
+const budgetRefusal = () => apiCallError(429, "rate limit exceeded", "text/plain");
+
+describe("isRetryable — the AI SDK's provider errors", () => {
+  it("returns true for a provider's 429 and 529", () => {
+    expect(isRetryable(apiCallError(429, '{"error":{"type":"rate_limit_error"}}'))).toBe(true);
+    expect(isRetryable(apiCallError(529, '{"error":{"type":"overloaded_error"}}'))).toBe(true);
+  });
+
+  it("returns true for a 5xx and a network failure the SDK marks retryable", () => {
+    expect(isRetryable(apiCallError(503, "upstream unavailable", "text/plain"))).toBe(true);
+    expect(isRetryable(apiCallError(undefined, "", "text/plain", true))).toBe(true);
+  });
+
+  it("follows the provider's verdict over the status", () => {
+    expect(
+      isRetryable(
+        apiCallError(429, '{"error":{"code":"insufficient_quota"}}', "application/json", false),
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false for a provider's 400 and 401", () => {
+    expect(isRetryable(apiCallError(400, '{"error":"bad request"}'))).toBe(false);
+    expect(isRetryable(apiCallError(401, '{"error":"bad key"}'))).toBe(false);
+  });
+
+  it("reads `statusCode` when the error states no verdict of its own", () => {
+    expect(isRetryable({ statusCode: 429 })).toBe(true);
+    expect(isRetryable({ statusCode: 529 })).toBe(true);
+    expect(isRetryable({ statusCode: 400 })).toBe(false);
+  });
+
+  it("never retries the model gateway's refusal for a spent run budget", () => {
+    // The SDK marks every 429 retryable, this one included.
+    expect(budgetRefusal().isRetryable).toBe(true);
+    expect(isRetryable(budgetRefusal())).toBe(false);
+    expect(isRetryable(apiCallError(429, "rate limit exceeded\n", "text/plain"))).toBe(false);
+    expect(isRetryable({ statusCode: 429, responseBody: "rate limit exceeded" })).toBe(false);
+    expect(isRetryable({ status: 429, responseBody: "rate limit exceeded" })).toBe(false);
+  });
+
+  it("still retries a 429 with any other body", () => {
+    expect(isRetryable(apiCallError(429, "rate limit exceeded, retry in 1s", "text/plain"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("withRetry — the AI SDK's provider errors", () => {
+  it("retries a provider's 429 and succeeds", async () => {
+    let calls = 0;
+    const result = await withRetry(
+      async () => {
+        calls++;
+        if (calls < 3) throw apiCallError(429, '{"error":{"type":"rate_limit_error"}}');
+        return "recovered";
+      },
+      3,
+      0,
+    );
+    expect(result).toBe("recovered");
+    expect(calls).toBe(3);
+  });
+
+  it("fails at once on the gateway's budget refusal, rethrowing it unchanged", async () => {
+    let calls = 0;
+    const refusal = budgetRefusal();
+    await expect(
+      withRetry(
+        async () => {
+          calls++;
+          throw refusal;
+        },
+        3,
+        0,
+      ),
+    ).rejects.toBe(refusal);
+    expect(calls).toBe(1);
+  });
+
+  // A 401 keeps its status and the provider's body, so the turn's error still
+  // reports it as a failed model call with the provider's reason.
+  it("fails at once on a provider's 401, rethrowing it unchanged", async () => {
+    let calls = 0;
+    const unauthorized = apiCallError(401, '{"error":"bad key"}');
+    await expect(
+      withRetry(
+        async () => {
+          calls++;
+          throw unauthorized;
+        },
+        3,
+        0,
+      ),
+    ).rejects.toBe(unauthorized);
+    expect(calls).toBe(1);
+  });
+
+  it("retries a real provider's 429 from doStream, but not the gateway's refusal", async () => {
+    const answers = [
+      () =>
+        new Response('{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}', {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        }),
+      () =>
+        new Response("rate limit exceeded", {
+          status: 429,
+          headers: { "content-type": "text/plain" },
+        }),
+    ];
+    let requests = 0;
+    const fetch = async () => {
+      requests++;
+      return (answers[requests - 1] ?? answers[1])();
+    };
+    const model = createAnthropic({
+      apiKey: "test-key",
+      fetch: fetch as unknown as typeof globalThis.fetch,
+    })("claude-sonnet-4-5");
+    const failed = await withRetry(
+      async () =>
+        model.doStream({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] }),
+      3,
+      0,
+    ).catch((err: unknown) => err);
+    // The provider's 429 was retried; the refusal that answered the retry ended it.
+    expect(requests).toBe(2);
+    expect(APICallError.isInstance(failed)).toBe(true);
+    expect((failed as APICallError).responseBody).toBe("rate limit exceeded");
   });
 });
