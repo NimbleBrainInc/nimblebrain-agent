@@ -18,7 +18,7 @@ import * as acp from "@agentclientprotocol/sdk/unstable";
 import type { LanguageModelV4, LanguageModelV4Message } from "@ai-sdk/provider";
 import { contextHooks, type TurnContext } from "../context/hooks.ts";
 import { AgentEngine } from "../engine/engine.ts";
-import type { EngineConfig, EngineEvent, EventSink } from "../engine/types.ts";
+import type { EngineConfig, EngineEvent, EventSink, StopReason } from "../engine/types.ts";
 import type { ModelAccess, ModelResolver } from "../model/resolve.ts";
 import { log } from "../observability/log.ts";
 import { addUsage, type TokenUsage } from "../usage/types.ts";
@@ -202,8 +202,17 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       } catch (err) {
         await updates.drained();
         if (turn.signal.aborted) {
+          // The calls made before the cancel were billed, so the turn reports them.
+          const usage = turnUsage(calls);
           log.info("[acp] turn ended", { ...turnFields(), stop_reason: "cancelled" });
-          return { stopReason: "cancelled" as const };
+          return {
+            stopReason: "cancelled" as const,
+            usage: acpUsage(usage.total),
+            _meta: {
+              [STOP_REASON_META_KEY]: "cancelled" satisfies StopReason,
+              [USAGE_META_KEY]: usage,
+            },
+          };
         }
         log.warn("[acp] turn failed", { ...turnFields(), ...failureOf(err) });
         throw modelCallError(err, turnUsage(calls), credentialsOf(session.access, env)) ?? err;
