@@ -20,6 +20,7 @@
     "@ai-sdk/openai": "4.0.70",
     "@ai-sdk/openai-compatible": "3.0.62",
     "@ai-sdk/provider": "4.0.17",
+    "@ai-sdk/provider-utils": "5.0.44",
     "@ai-sdk/xai": "4.0.59",
     "@modelcontextprotocol/client": "2.3.0",
     "@modelcontextprotocol/core": "2.3.0",
