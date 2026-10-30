@@ -29,6 +29,7 @@ import {
   type McpToolRouter,
   type ReachableMcpServer,
 } from "./mcp-tool-router.ts";
+import { credentialsOf, modelCallError } from "./model-error.ts";
 import {
   disableProvider,
   listProviders,
@@ -205,7 +206,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
           return { stopReason: "cancelled" as const };
         }
         log.warn("[acp] turn failed", { ...turnFields(), ...failureOf(err) });
-        throw err;
+        throw modelCallError(err, turnUsage(calls), credentialsOf(session.access, env)) ?? err;
       } finally {
         if (session.turn === turn) session.turn = undefined;
         opts.lifecycle?.turnEnded();

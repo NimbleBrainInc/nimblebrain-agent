@@ -139,6 +139,18 @@ A `session/prompt` response carries in `_meta`:
   `TokenUsage` (`src/usage/types.ts`), which keeps what ACP's `usage` drops: the 1-hour share of cache writes, and the
   per-call split that tiered prices are computed from.
 
+A turn that fails on a model call (an error with an HTTP status) answers `session/prompt` with a
+JSON-RPC internal error (`-32603`), message `Internal error: model call failed with status <status>:
+<reason>`, whose `data` carries:
+
+- `"nimblebrain-agent/modelError"`: `{ status, reason? }`, the call's HTTP status and the provider's
+  reason: the body it answered with, else the error's message, at most 500 characters. Every
+  credential the agent holds (a route's headers, the process's keys) is cut from it.
+- `"nimblebrain-agent/usage"`: the usage of the turn's model calls before the failed one, in the
+  shape above.
+
+Any other failure is an internal error with no `data` of nimblebrain-agent's own.
+
 ## Embedding
 
 `createAgent({ resolveModel, defaults })` (`src/acp/agent.ts`) returns an ACP agent app to
