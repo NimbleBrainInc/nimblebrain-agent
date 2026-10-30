@@ -16,11 +16,18 @@ import { MODEL_ERROR_KEY, type TurnUsage, USAGE_META_KEY } from "./session-optio
 /** The most of the provider's text the error carries. */
 const MAX_REASON_CHARS = 500;
 
-/** Shorter values are not credentials worth cutting, and cutting them would mangle the text. */
-const MIN_SECRET_CHARS = 8;
+/** Environment variables whose values are the agent's model keys: cut at any length. */
+const API_KEY_VAR = /_API_KEY$/i;
 
-/** Environment variables whose values are credentials. */
+/** Environment variables whose names suggest a credential. */
 const SECRET_VAR = /KEY|TOKEN|SECRET|PASSWORD/i;
+
+/**
+ * The shortest value cut for a name that only suggests a credential: such a
+ * name also matches settings (`TOKENIZERS_PARALLELISM=false`), and cutting
+ * their short values would mangle the text.
+ */
+const MIN_GUESSED_SECRET_CHARS = 8;
 
 /** What a failed model call reported: its HTTP status and the provider's reason. */
 export interface ModelCallFailure {
@@ -50,8 +57,9 @@ export function modelCallError(
 
 /**
  * Every credential the agent holds for a session's model calls: the headers of
- * the client's provider routes (a bearer's token on its own too), and the
- * process's own keys.
+ * the client's provider routes (a bearer's token on its own too) and the
+ * process's model keys, at any length, and the values of other variables named
+ * like a credential.
  */
 export function credentialsOf(
   access: ModelAccess | undefined,
@@ -64,9 +72,11 @@ export function credentialsOf(
     }
   }
   for (const [name, value] of Object.entries(env)) {
-    if (value && SECRET_VAR.test(name)) values.push(value);
+    if (!value) continue;
+    if (API_KEY_VAR.test(name)) values.push(value);
+    else if (SECRET_VAR.test(name) && value.length >= MIN_GUESSED_SECRET_CHARS) values.push(value);
   }
-  return [...new Set(values)].filter((v) => v.length >= MIN_SECRET_CHARS);
+  return [...new Set(values)].filter((v) => v.trim() !== "");
 }
 
 /** The call's HTTP status: the AI SDK's `statusCode`, or a vendor SDK's `status`. */
