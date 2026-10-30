@@ -43,18 +43,21 @@ async function connect(env: Record<string, string | undefined> = {}) {
   const init = await agent.request(acp.methods.agent.initialize, {
     protocolVersion: acp.PROTOCOL_VERSION,
   });
-  const turn = async (params: Partial<acp.NewSessionRequest> = {}) => {
+  const open = async (params: Partial<acp.NewSessionRequest> = {}) => {
     const { sessionId } = await agent.request(acp.methods.agent.session.new, {
       cwd: "/",
       mcpServers: [],
       ...params,
     });
-    return agent.request(acp.methods.agent.session.prompt, {
+    return sessionId;
+  };
+  const prompt = (sessionId: string) =>
+    agent.request(acp.methods.agent.session.prompt, {
       sessionId,
       prompt: [{ type: "text", text: "hi" }],
     });
-  };
-  return { agent, init, turn, prompts, accesses, close: () => connection.close() };
+  const turn = async (params: Partial<acp.NewSessionRequest> = {}) => prompt(await open(params));
+  return { agent, init, open, prompt, turn, prompts, accesses, close: () => connection.close() };
 }
 
 const text = (t: string): acp.ContentBlock => ({ type: "text", text: t });
@@ -158,6 +161,31 @@ describe("providers", () => {
       route.baseUrl,
     );
     expect(providers.find((p) => p.providerId === "openai")?.current).toBeNull();
+    c.close();
+  });
+
+  test("a session keeps the routes it opened with; a later set or disable reaches new sessions only", async () => {
+    const c = await connect();
+    const route = (baseUrl: string) => ({
+      providerId: "anthropic",
+      apiType: "anthropic",
+      baseUrl,
+      headers: {},
+    });
+    await c.agent.request(acp.methods.agent.providers.set, route("https://first.example/v1"));
+    const earlier = await c.open();
+    await c.agent.request(acp.methods.agent.providers.set, route("https://second.example/v1"));
+    await c.agent.request(acp.methods.agent.providers.disable, { providerId: "openai" });
+    const later = await c.open();
+
+    await c.prompt(earlier);
+    expect(c.accesses.at(-1)).toEqual({
+      providers: { anthropic: { baseUrl: "https://first.example/v1", headers: {} } },
+    });
+    await c.prompt(later);
+    expect(c.accesses.at(-1)).toEqual({
+      providers: { anthropic: { baseUrl: "https://second.example/v1", headers: {} }, openai: null },
+    });
     c.close();
   });
 

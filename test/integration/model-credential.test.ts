@@ -270,11 +270,28 @@ test("a providers/set route carries its own headers and never the worker's key",
       anthropic: { baseUrl: `${base}/anthropic/v1`, headers: { authorization: "Bearer turn-jwt" } },
     });
     await call("xai:grok-4", { xai: { baseUrl: `${base}/xai/v1`, headers: {} } });
+    // A route wins over the session's credential and endpoints for its provider.
+    try {
+      await resolve("anthropic:claude-sonnet-4-6", {
+        providers: { anthropic: { baseUrl: `${base}/routed/v1`, headers: {} } },
+        credential: "session-credential",
+        endpoint: `${base}/endpoint/v1`,
+        endpoints: { anthropic: `${base}/endpoints/v1` },
+      }).doGenerate({ prompt });
+    } catch {
+      // Refused by the stand-in; the request is what is read.
+    }
 
-    expect(paths).toEqual(["/anthropic/v1/messages", "/xai/v1/chat/completions"]);
+    expect(paths).toEqual([
+      "/anthropic/v1/messages",
+      "/xai/v1/chat/completions",
+      "/routed/v1/messages",
+    ]);
     expect(seen[0]?.get("authorization")).toBe("Bearer turn-jwt");
     expect(seen[0]?.get("x-api-key")).toBeNull();
     expect(seen[1]?.get("authorization")).toBeNull();
+    expect(seen[2]?.get("authorization")).toBeNull();
+    expect(seen[2]?.get("x-api-key")).toBeNull();
 
     expect(() => resolve("openai:gpt-5", { providers: { openai: null } })).toThrow(
       /"openai" is disabled/,
