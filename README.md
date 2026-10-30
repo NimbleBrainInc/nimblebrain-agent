@@ -140,7 +140,8 @@ A `session/prompt` response carries in `_meta`:
   per-call split that tiered prices are computed from. A cancelled turn reports the calls that
   finished before the cancel; a call the cancel cut off reported no usage and is not listed.
 
-A turn that fails on a model call (an error with an HTTP status) answers `session/prompt` with a
+A turn that fails on a model call (an error with an HTTP status, whether the provider answered with
+it or sent it inside the stream, as Anthropic does with `overloaded_error`) answers `session/prompt` with a
 JSON-RPC internal error (`-32603`), message `Internal error: model call failed with status <status>:
 <reason>`, whose `data` carries:
 

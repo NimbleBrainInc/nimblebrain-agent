@@ -1,12 +1,20 @@
 import { describe, expect, it } from "bun:test";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import {
   APICallError,
   type LanguageModelV4,
   type LanguageModelV4CallOptions,
   type LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
+import { createProviderStreamError } from "@ai-sdk/provider-utils";
+import { modelCallError } from "../../src/acp/model-error.ts";
 import { withRetry } from "../../src/engine/retry.ts";
-import { callModel, ModelStreamStallError, NO_FINISH_PART_RAW } from "../../src/model/stream.ts";
+import {
+  callModel,
+  ModelStreamError,
+  ModelStreamStallError,
+  NO_FINISH_PART_RAW,
+} from "../../src/model/stream.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 
 function userPrompt(text: string): LanguageModelV4CallOptions {
@@ -647,5 +655,266 @@ describe("callModel + withRetry — a stream cut mid-read", () => {
 
     expect(calls).toBe(2);
     expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error parts inside the stream
+// ---------------------------------------------------------------------------
+
+/** Anthropic's in-stream `overloaded_error`, as its provider enqueues it. */
+const overloaded = createProviderStreamError({
+  message: "Overloaded",
+  type: "overloaded_error",
+  statusCode: 529,
+  isRetryable: true,
+  data: { type: "error", error: { type: "overloaded_error", message: "Overloaded" } },
+});
+
+/**
+ * A stream that emits `parts` in order, then closes, or stays open if
+ * `keepOpen`. Records whether the consumer cancelled it, which is what closes
+ * the provider's response body.
+ */
+function partsStream(
+  parts: LanguageModelV4StreamPart[],
+  opts: { keepOpen?: boolean; onCancel?: () => void } = {},
+): ReadableStream<LanguageModelV4StreamPart> {
+  return new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(part);
+      if (!opts.keepOpen) controller.close();
+    },
+    cancel() {
+      opts.onCancel?.();
+    },
+  });
+}
+
+const textParts: LanguageModelV4StreamPart[] = [
+  { type: "text-start", id: "t0" },
+  { type: "text-delta", id: "t0", delta: "hi" },
+  { type: "text-end", id: "t0" },
+];
+
+const parseFailure = new TypeError("Type validation failed: unknown chunk type");
+
+async function streamError(promise: Promise<unknown>): Promise<ModelStreamError> {
+  const err = await promise.then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+  expect(err).toBeInstanceOf(ModelStreamError);
+  return err as ModelStreamError;
+}
+
+describe("callModel — error parts", () => {
+  it("test_provider_error_before_output_throws_with_provider_verdict", async () => {
+    let cancelled = false;
+    const model = scriptedModel([
+      () =>
+        partsStream(
+          [
+            { type: "stream-start", warnings: [] },
+            { type: "error", error: overloaded },
+          ],
+          {
+            keepOpen: true,
+            onCancel: () => {
+              cancelled = true;
+            },
+          },
+        ),
+    ]);
+    const err = await streamError(callModel(model, userPrompt("x"), () => {}));
+    expect(err.message).toBe("Overloaded");
+    expect(err.statusCode).toBe(529);
+    expect(err.isRetryable).toBe(true);
+    // Left for withRetry to classify from the provider's verdict.
+    expect(err.retryable).toBeUndefined();
+    expect(err.cause).toBe(overloaded);
+    expect(cancelled).toBe(true);
+  });
+
+  it("test_provider_error_before_output_is_retried_by_withRetry", async () => {
+    const model = scriptedModel([
+      () =>
+        partsStream([
+          { type: "stream-start", warnings: [] },
+          { type: "error", error: overloaded },
+        ]),
+      () => textStream("recovered"),
+    ]);
+    const result = await withRetry(() => callModel(model, userPrompt("x"), () => {}), 3, 0);
+    expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+  });
+
+  it("test_provider_error_after_output_is_not_retried", async () => {
+    let calls = 0;
+    const deltas: string[] = [];
+    const model = scriptedModel([
+      () => {
+        calls++;
+        return partsStream([...textParts.slice(0, 2), { type: "error", error: overloaded }]);
+      },
+      () => {
+        calls++;
+        return textStream("again");
+      },
+    ]);
+    const err = await streamError(
+      withRetry(() => callModel(model, userPrompt("x"), (d) => deltas.push(d)), 3, 0),
+    );
+    expect(err.retryable).toBe(false);
+    expect(err.statusCode).toBe(529);
+    expect(calls).toBe(1);
+    expect(deltas).toEqual(["hi"]);
+  });
+
+  it("test_provider_error_reaches_the_turn_error_with_its_status", async () => {
+    const model = scriptedModel([
+      () => partsStream([...textParts.slice(0, 2), { type: "error", error: overloaded }]),
+    ]);
+    const err = await streamError(callModel(model, userPrompt("x"), () => {}));
+    const usage = { calls: [], total: { inputTokens: 0, outputTokens: 0 } };
+    const failed = modelCallError(err, usage, []);
+    expect(failed?.message).toContain("model call failed with status 529: Overloaded");
+  });
+
+  it("test_parse_failure_then_clean_finish_returns_the_turn", async () => {
+    const model = scriptedModel([
+      () =>
+        partsStream([
+          { type: "error", error: parseFailure },
+          ...textParts,
+          { type: "finish", usage: USAGE, finishReason: { unified: "stop", raw: "end_turn" } },
+        ]),
+    ]);
+    const result = await callModel(model, userPrompt("x"), () => {});
+    expect(result.content).toEqual([{ type: "text", text: "hi" }]);
+    expect(result.finishReason).toEqual({ unified: "stop", raw: "end_turn" });
+  });
+
+  it("test_parse_failure_before_output_without_clean_finish_throws", async () => {
+    const endings: Array<LanguageModelV4StreamPart[]> = [
+      [],
+      [{ type: "finish", usage: USAGE, finishReason: { unified: "error", raw: undefined } }],
+      // The SDK's default finish when the provider never saw a stop reason.
+      [{ type: "finish", usage: USAGE, finishReason: { unified: "other", raw: undefined } }],
+    ];
+    for (const ending of endings) {
+      const model = scriptedModel([
+        () => partsStream([{ type: "error", error: parseFailure }, ...ending]),
+      ]);
+      const err = await streamError(callModel(model, userPrompt("x"), () => {}));
+      expect(err.cause).toBe(parseFailure);
+      expect(err.retryable).toBeUndefined();
+    }
+  });
+
+  it("test_parse_failure_after_output_without_clean_finish_throws_not_retryable", async () => {
+    // Anthropic drops every chunk after an out-of-order `message_start`, so the
+    // stream ends with no finish once output went out.
+    const endings: Array<LanguageModelV4StreamPart[]> = [
+      [],
+      [{ type: "finish", usage: USAGE, finishReason: { unified: "error", raw: undefined } }],
+    ];
+    for (const ending of endings) {
+      let calls = 0;
+      const model = scriptedModel([
+        () => {
+          calls++;
+          return partsStream([...textParts, { type: "error", error: parseFailure }, ...ending]);
+        },
+      ]);
+      const err = await streamError(
+        withRetry(() => callModel(model, userPrompt("x"), () => {}), 3, 0),
+      );
+      expect(err.cause).toBe(parseFailure);
+      expect(err.retryable).toBe(false);
+      expect(calls).toBe(1);
+    }
+  });
+
+  it("test_parse_failure_after_output_then_clean_finish_returns_the_turn", async () => {
+    const model = scriptedModel([
+      () =>
+        partsStream([
+          ...textParts,
+          { type: "error", error: parseFailure },
+          { type: "finish", usage: USAGE, finishReason: { unified: "stop", raw: "end_turn" } },
+        ]),
+    ]);
+    const result = await callModel(model, userPrompt("x"), () => {});
+    expect(result.content).toEqual([{ type: "text", text: "hi" }]);
+    expect(result.usage).toEqual(USAGE);
+  });
+});
+
+/** One Anthropic SSE event in its wire format. */
+function sse(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+const MESSAGE_START = sse("message_start", {
+  type: "message_start",
+  message: {
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    model: "claude-sonnet-4-5",
+    content: [],
+    stop_reason: null,
+    stop_sequence: null,
+    usage: { input_tokens: 5, output_tokens: 1 },
+  },
+});
+
+const OVERLOADED = sse("error", {
+  type: "error",
+  error: { type: "overloaded_error", message: "Overloaded" },
+});
+
+/** A complete Anthropic text reply. */
+const REPLY = [
+  MESSAGE_START,
+  sse("content_block_start", {
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "text", text: "" },
+  }),
+  sse("content_block_delta", {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: "recovered" },
+  }),
+  sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+  sse("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: "end_turn", stop_sequence: null },
+    usage: { output_tokens: 2 },
+  }),
+  sse("message_stop", { type: "message_stop" }),
+].join("");
+
+describe("callModel + @ai-sdk/anthropic — overloaded_error sent inside the stream", () => {
+  it("test_anthropic_in_stream_overload_is_retried_not_returned_as_a_turn", async () => {
+    const bodies = [MESSAGE_START + OVERLOADED, REPLY];
+    let requests = 0;
+    const fetch = async () => {
+      const body = bodies[Math.min(requests, bodies.length - 1)];
+      requests++;
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const model = createAnthropic({
+      apiKey: "test-key",
+      fetch: fetch as unknown as typeof globalThis.fetch,
+    })("claude-sonnet-4-5");
+
+    const result = await withRetry(() => callModel(model, userPrompt("x"), () => {}), 3, 0);
+
+    expect(requests).toBe(2);
+    expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+    expect(result.finishReason.unified).toBe("stop");
   });
 });
