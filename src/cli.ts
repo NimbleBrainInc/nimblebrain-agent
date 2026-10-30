@@ -81,6 +81,7 @@ export async function serveAcp(env: Env = process.env): Promise<void> {
   const agent = createAgent({
     resolveModel: createModelResolver(env),
     defaults: defaultsFrom(env),
+    env,
   });
   const connection = agent.connect(
     acp.ndJsonStream(
@@ -120,7 +121,7 @@ export function connectionAuthFrom(env: Env): ConnectionAuth | null {
 /** Serve over HTTP until SIGTERM or SIGINT, then drain. */
 export async function serveWorker(env: Env = process.env): Promise<void> {
   const worker = await serveHttp(
-    { resolveModel: createModelResolver(env), defaults: defaultsFrom(env) },
+    { resolveModel: createModelResolver(env), defaults: defaultsFrom(env), env },
     {
       hostname: env.NB_AGENT_HOST || "127.0.0.1",
       port: intFrom(env, "NB_AGENT_PORT") ?? DEFAULT_PORT,

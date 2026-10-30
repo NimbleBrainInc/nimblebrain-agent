@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { createModelResolver } from "../../src/model/resolve.ts";
+import { createModelResolver, type ProviderRoute } from "../../src/model/resolve.ts";
 
 // A session's model credential reaches the gateway as `Authorization: Bearer`,
 // in place of the worker's provider key.
@@ -227,9 +227,59 @@ for (const model of ["nebius:Qwen/Qwen3-235B-A22B-Instruct-2507", "greenpt:gpt-o
         json_schema: { name: "reply", schema },
       });
       const finish = parts.find((p) => p.type === "finish");
-      expect(finish?.usage).toMatchObject({ inputTokens: { total: 11 }, outputTokens: { total: 7 } });
+      expect(finish?.usage).toMatchObject({
+        inputTokens: { total: 11 },
+        outputTokens: { total: 7 },
+      });
     } finally {
       await server.stop(true);
     }
   });
 }
+
+// A route the client set with ACP's `providers/set` sends the provider's calls to
+// its base URL with its headers alone: no worker key, and nothing at all when the
+// headers are empty. A disabled provider refuses the call.
+test("a providers/set route carries its own headers and never the worker's key", async () => {
+  const paths: string[] = [];
+  const seen: Headers[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      paths.push(new URL(req.url).pathname);
+      seen.push(req.headers);
+      return Response.json({ error: { message: "no" } }, { status: 401 });
+    },
+  });
+  try {
+    const resolve = createModelResolver({
+      ANTHROPIC_API_KEY: "worker-key",
+      XAI_API_KEY: "worker-key",
+    });
+    const base = `http://127.0.0.1:${server.port}`;
+    const prompt = [{ role: "user" as const, content: [{ type: "text" as const, text: "hi" }] }];
+    const call = async (model: string, providers: Record<string, ProviderRoute>) => {
+      try {
+        await resolve(model, { providers }).doGenerate({ prompt });
+      } catch {
+        // Refused by the stand-in; the request is what is read.
+      }
+    };
+    await call("anthropic:claude-sonnet-4-6", {
+      anthropic: { baseUrl: `${base}/anthropic/v1`, headers: { authorization: "Bearer turn-jwt" } },
+    });
+    await call("xai:grok-4", { xai: { baseUrl: `${base}/xai/v1`, headers: {} } });
+
+    expect(paths).toEqual(["/anthropic/v1/messages", "/xai/v1/chat/completions"]);
+    expect(seen[0]?.get("authorization")).toBe("Bearer turn-jwt");
+    expect(seen[0]?.get("x-api-key")).toBeNull();
+    expect(seen[1]?.get("authorization")).toBeNull();
+
+    expect(() => resolve("openai:gpt-5", { providers: { openai: null } })).toThrow(
+      /"openai" is disabled/,
+    );
+  } finally {
+    await server.stop(true);
+  }
+});

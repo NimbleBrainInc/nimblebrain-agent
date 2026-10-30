@@ -24,6 +24,13 @@ import { log } from "../observability/log.ts";
 import { addUsage, type TokenUsage } from "../usage/types.ts";
 import { acpMcpTransport } from "./acp-mcp-transport.ts";
 import {
+  disableProvider,
+  listProviders,
+  type ProviderRoutes,
+  sessionRoutes,
+  setProvider,
+} from "./providers.ts";
+import {
   connectMcpToolRouter,
   httpMcpServer,
   type McpToolRouter,
@@ -64,6 +71,8 @@ export interface AgentOptions {
    * can wait for the turns in flight before it stops.
    */
   lifecycle?: AgentLifecycle;
+  /** The process's environment, which `providers/list` reports the default routes from. */
+  env?: Record<string, string | undefined>;
 }
 
 export interface AgentLifecycle {
@@ -74,6 +83,9 @@ export interface AgentLifecycle {
 
 export function createAgent(opts: AgentOptions): acp.AgentApp {
   const sessions = new Map<string, AgentSession>();
+  // One agent per connection, so this is the connection's own provider configuration.
+  const routes: ProviderRoutes = new Map();
+  const env = opts.env ?? process.env;
 
   return acp
     .agent({ name: "nimblebrain-agent" })
@@ -83,17 +95,30 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
         loadSession: false,
         promptCapabilities: { image: true, embeddedContext: true },
         mcpCapabilities: { http: true, acp: true },
+        sessionCapabilities: { systemPrompt: { mode: { override: {} } } },
+        providers: {},
       },
       agentInfo: { name: "nimblebrain-agent", version: AGENT_VERSION },
     }))
+    .onRequest(acp.methods.agent.providers.list, () => listProviders(routes, env))
+    .onRequest(acp.methods.agent.providers.set, (ctx) => {
+      setProvider(routes, ctx.params);
+      return {};
+    })
+    .onRequest(acp.methods.agent.providers.disable, (ctx) => {
+      disableProvider(routes, ctx.params);
+      return {};
+    })
     .onRequest(acp.methods.agent.session.new, async (ctx) => {
       const sent = (ctx.params._meta?.[SESSION_META_KEY] ?? {}) as SessionOptions;
       if (opts.lifecycle && !opts.lifecycle.admit()) {
         throw acp.RequestError.internalError(undefined, "the agent is draining");
       }
       const { history, modelCredential, modelEndpoint, modelEndpoints, ...overrides } = sent;
-      const access = sessionAccess({ modelCredential, modelEndpoint, modelEndpoints });
+      const access = sessionAccess({ modelCredential, modelEndpoint, modelEndpoints }, routes);
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
+      const system = systemOf(ctx.params.systemPrompt, opts.defaults.system);
+      if (system !== undefined) settings.system = system;
       const router = await connectMcpToolRouter(
         ctx.params.mcpServers.map((server) => reachable(server, ctx.client)),
       );
@@ -102,7 +127,7 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       logSessionOpened(sessionId, settings, {
         mcpServers: ctx.params.mcpServers.length,
         historyMessages: prior.length,
-        modelEndpoint: access?.endpoints?.[providerOf(settings.model)] ?? access?.endpoint,
+        modelEndpoint: endpointOf(access, providerOf(settings.model)),
       });
       sessions.set(sessionId, {
         settings,
@@ -243,12 +268,14 @@ function failureOf(err: unknown): { error: string; status?: number } {
 }
 
 /**
- * The session's own access to its models, from its options: its credential,
- * with the endpoints its calls go to. An endpoint without the credential is
- * refused, so a client can never send the worker's key to an address it chose.
+ * The session's own access to its models: the connection's provider routes
+ * (`providers/set`) as they stand now, and its options' credential with the
+ * endpoints its calls go to. An endpoint without the credential is refused, so
+ * a client can never send the worker's key to an address it chose.
  */
 function sessionAccess(
   sent: Pick<SessionOptions, "modelCredential" | "modelEndpoint" | "modelEndpoints">,
+  routes: ProviderRoutes,
 ): ModelAccess | undefined {
   const { modelCredential, modelEndpoint, modelEndpoints } = sent;
   if ((modelEndpoint || modelEndpoints) && !modelCredential) {
@@ -257,12 +284,43 @@ function sessionAccess(
       "modelEndpoint and modelEndpoints need the session's own modelCredential",
     );
   }
-  if (!modelCredential) return undefined;
+  const providers = sessionRoutes(routes);
+  if (!modelCredential && !providers) return undefined;
   return {
-    credential: modelCredential,
+    ...(providers ? { providers } : {}),
+    ...(modelCredential ? { credential: modelCredential } : {}),
     ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
     ...(modelEndpoints ? { endpoints: modelEndpoints } : {}),
   };
+}
+
+/**
+ * The session's system prompt from ACP's `systemPrompt`, or `undefined` when the
+ * client sent none. `override` replaces nimblebrain-agent's own prompt; `append`
+ * adds to it. Only text is taken, and any other mode is refused, as the spec asks.
+ */
+function systemOf(sent: acp.SystemPrompt | null | undefined, own: string): string | undefined {
+  if (!sent) return undefined;
+  const parts = sent.content.map((block) => {
+    if (block.type !== "text") {
+      throw acp.RequestError.invalidParams(undefined, "systemPrompt takes text content only");
+    }
+    return block.text;
+  });
+  const text = parts.join("\n\n");
+  if (sent.mode === "override") return text;
+  if (sent.mode === "append") return own ? `${own}\n\n${text}` : text;
+  throw acp.RequestError.invalidParams(
+    undefined,
+    `systemPrompt mode "${sent.mode}" is not supported`,
+  );
+}
+
+/** Where a session's calls for one provider go, when the session says. */
+function endpointOf(access: ModelAccess | undefined, provider: string): string | undefined {
+  const route = access?.providers?.[provider];
+  if (route) return route.baseUrl;
+  return access?.credential ? (access.endpoints?.[provider] ?? access.endpoint) : undefined;
 }
 
 /** The provider half of a `provider:model` string, empty when it names none. */

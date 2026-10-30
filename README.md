@@ -89,6 +89,22 @@ docker run -p 8080:8080 -v ./keys:/keys:ro -e NB_AGENT_AUTH_JWKS_FILE=/keys/run-
   answers `cancelled`.
 - **Multi-turn:** a session keeps its own history across prompts.
 
+## Standard ACP fields
+
+nimblebrain-agent takes these ACP fields (both unstable in the spec) and advertises them at `initialize`:
+
+- **`systemPrompt` on `session/new`** (`sessionCapabilities.systemPrompt`, append and override).
+  `override` replaces nimblebrain-agent's own prompt; `append` adds to it. Text content only. It wins over
+  the `system` session option.
+- **`providers/list`, `providers/set`, `providers/disable`** (`agentCapabilities.providers`). Every
+  provider is listed with its protocol (`anthropic`, `openai`, or `gemini` for Google; xAI, Nebius and
+  GreenPT speak `openai`) and where its calls go now. `providers/set` sends that provider's calls to
+  `baseUrl` with exactly `headers`, and never with the worker's own key; empty headers send no
+  authorization. `providers/disable` makes the provider refuse calls. The configuration belongs to the
+  connection (`serve` gives each connection an agent of its own) and reaches the sessions opened after it.
+  A route a client set wins over `modelCredential` / `modelEndpoints` for that provider. Headers are never
+  listed or logged.
+
 ## Session options
 
 A client that owns the conversation can hand nimblebrain-agent the turn's context on `session/new`. Every field
