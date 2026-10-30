@@ -2,8 +2,10 @@
  * nimblebrain-agent's session options: what a client may send beyond ACP v1, and the one
  * thing nimblebrain-agent sends back.
  *
- * ACP v1 has no slot for a client's system prompt, for history the agent did
- * not produce itself, or for a turn's limits. A client that holds those (a
+ * ACP v1 has no slot for history the agent did not produce itself or for a
+ * turn's limits. (Its `systemPrompt` and `providers/*` fields, which the agent
+ * also takes, cover a system prompt and model access, and win over `system` and
+ * the model credential options here when a client sends both.) A client that holds those (a
  * host that owns the conversation, as NimbleBrain does) sends them on
  * `session/new` under {@link SESSION_META_KEY}. Every field is optional: what a
  * client leaves out comes from nimblebrain-agent's own defaults (`nimblebrain-agent acp` reads them
