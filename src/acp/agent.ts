@@ -24,6 +24,12 @@ import { log } from "../observability/log.ts";
 import { addUsage, type TokenUsage } from "../usage/types.ts";
 import { acpMcpTransport } from "./acp-mcp-transport.ts";
 import {
+  connectMcpToolRouter,
+  httpMcpServer,
+  type McpToolRouter,
+  type ReachableMcpServer,
+} from "./mcp-tool-router.ts";
+import {
   disableProvider,
   listProviders,
   type ProviderRoutes,
@@ -31,15 +37,10 @@ import {
   setProvider,
 } from "./providers.ts";
 import {
-  connectMcpToolRouter,
-  httpMcpServer,
-  type McpToolRouter,
-  type ReachableMcpServer,
-} from "./mcp-tool-router.ts";
-import {
   decodeMessages,
   type ModelCallUsage,
   promptToUserMessage,
+  REPLACED_OPTIONS,
   SESSION_META_KEY,
   type SessionOptions,
   type SessionSettings,
@@ -114,8 +115,9 @@ export function createAgent(opts: AgentOptions): acp.AgentApp {
       if (opts.lifecycle && !opts.lifecycle.admit()) {
         throw acp.RequestError.internalError(undefined, "the agent is draining");
       }
-      const { history, modelCredential, modelEndpoint, modelEndpoints, ...overrides } = sent;
-      const access = sessionAccess({ modelCredential, modelEndpoint, modelEndpoints }, routes);
+      refuseReplacedOptions(sent);
+      const { history, ...overrides } = sent;
+      const access = sessionAccess(routes);
       const settings: SessionSettings = { ...opts.defaults, ...overrides };
       const system = systemOf(ctx.params.systemPrompt, opts.defaults.system);
       if (system !== undefined) settings.system = system;
@@ -267,31 +269,22 @@ function failureOf(err: unknown): { error: string; status?: number } {
   };
 }
 
-/**
- * The session's own access to its models: the connection's provider routes
- * (`providers/set`) as they stand now, and its options' credential with the
- * endpoints its calls go to. An endpoint without the credential is refused, so
- * a client can never send the worker's key to an address it chose.
- */
-function sessionAccess(
-  sent: Pick<SessionOptions, "modelCredential" | "modelEndpoint" | "modelEndpoints">,
-  routes: ProviderRoutes,
-): ModelAccess | undefined {
-  const { modelCredential, modelEndpoint, modelEndpoints } = sent;
-  if ((modelEndpoint || modelEndpoints) && !modelCredential) {
-    throw acp.RequestError.invalidParams(
-      undefined,
-      "modelEndpoint and modelEndpoints need the session's own modelCredential",
-    );
-  }
+/** The session's own access to its models: the connection's provider routes as they stand now. */
+function sessionAccess(routes: ProviderRoutes): ModelAccess | undefined {
   const providers = sessionRoutes(routes);
-  if (!modelCredential && !providers) return undefined;
-  return {
-    ...(providers ? { providers } : {}),
-    ...(modelCredential ? { credential: modelCredential } : {}),
-    ...(modelEndpoint ? { endpoint: modelEndpoint } : {}),
-    ...(modelEndpoints ? { endpoints: modelEndpoints } : {}),
-  };
+  return providers ? { providers } : undefined;
+}
+
+/** Refuse an option ACP's own fields replaced, naming the field to use. */
+function refuseReplacedOptions(sent: Record<string, unknown>): void {
+  for (const [option, use] of Object.entries(REPLACED_OPTIONS)) {
+    if (option in sent) {
+      throw acp.RequestError.invalidParams(
+        undefined,
+        `the session option "${option}" is gone: use ${use}`,
+      );
+    }
+  }
 }
 
 /**
@@ -318,9 +311,7 @@ function systemOf(sent: acp.SystemPrompt | null | undefined, own: string): strin
 
 /** Where a session's calls for one provider go, when the session says. */
 function endpointOf(access: ModelAccess | undefined, provider: string): string | undefined {
-  const route = access?.providers?.[provider];
-  if (route) return route.baseUrl;
-  return access?.credential ? (access.endpoints?.[provider] ?? access.endpoint) : undefined;
+  return access?.providers?.[provider]?.baseUrl;
 }
 
 /** The provider half of a `provider:model` string, empty when it names none. */

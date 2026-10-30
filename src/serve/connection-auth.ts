@@ -18,8 +18,8 @@
  * no restart.
  */
 
-import { readFile } from "node:fs/promises";
 import { createPublicKey, type KeyObject, verify } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 /** The audience of a connection credential. */
 export const CONNECTION_AUDIENCE = "acp-worker";

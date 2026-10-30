@@ -27,26 +27,14 @@ export interface ProviderRoute {
 }
 
 /**
- * A session's own access to its models.
- *
- * - `providers`: what the client set per provider over ACP (`providers/set`,
- *   `providers/disable`), ahead of everything below. A route sends the
- *   provider's calls to its base URL with its headers alone; `null` is a
- *   provider the client turned off, which refuses every call.
- * - `credential`: a bearer the client handed the session in its options (a
- *   gateway's per-turn credential), presented in place of the process's key.
- *   Its calls go to `endpoints[provider]` when the client named one, else to
- *   `endpoint`, else to the process's own. An endpoint exists only beside a
- *   credential, so a client can never send the process's key to an address it
- *   chose.
- *
- * Whatever the session's access leaves out uses the process's key and endpoint.
+ * A session's own access to its models: what the client set per provider over
+ * ACP (`providers/set`, `providers/disable`). A route sends the provider's calls
+ * to its base URL with its headers alone; `null` is a provider the client turned
+ * off, which refuses every call. A provider the session says nothing about uses
+ * the process's key and endpoint.
  */
 export interface ModelAccess {
   providers?: Record<string, ProviderRoute | null>;
-  credential?: string;
-  endpoint?: string;
-  endpoints?: Record<string, string>;
 }
 
 export type ModelResolver = (model: string, access?: ModelAccess) => LanguageModelV4;
@@ -101,11 +89,10 @@ const GREENPT_BASE_URL = "https://api.greenpt.ai/v1";
 const NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1";
 
 /**
- * The key a provider's client is built with when the session's credential
- * stands in for it. The client needs one; {@link credentialFetch} removes it
- * from every request.
+ * The key a provider's client is built with on a client's route. The client
+ * needs one; {@link routeFetch} removes it from every request.
  */
-const SESSION_CREDENTIAL_KEY = "session-credential";
+const ROUTE_KEY_PLACEHOLDER = "client-route";
 
 /** The headers provider clients carry a key in. */
 const KEY_HEADERS = ["x-api-key", "x-goog-api-key", "authorization"];
@@ -127,27 +114,10 @@ function routeFetch(route: ProviderRoute, base: typeof fetch = globalThis.fetch)
   return Object.assign(withRoute, { preconnect: base.preconnect }) as typeof fetch;
 }
 
-/**
- * The fetch a session's calls go through when it has its own credential: every
- * header a provider client puts its key in is removed, and the credential goes
- * as `Authorization: Bearer`, whichever provider the call is for.
- */
-function credentialFetch(credential: string, base: typeof fetch = globalThis.fetch): typeof fetch {
-  const withCredential = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    const headers = new Headers(
-      init?.headers ?? (input instanceof Request ? input.headers : undefined),
-    );
-    for (const name of KEY_HEADERS) headers.delete(name);
-    headers.set("authorization", `Bearer ${credential}`);
-    return base(input, { ...init, headers });
-  };
-  return Object.assign(withCredential, { preconnect: base.preconnect }) as typeof fetch;
-}
-
 export function createModelResolver(env: Env = process.env): ModelResolver {
   const cache = new Map<string, LanguageModelV4>();
   return (model, access) => {
-    // A session's own credential is never cached: it lives as long as the session.
+    // A session's own routes are never cached: they live as long as the session.
     if (access) return resolveModel(model, env, access);
     const cached = cache.get(model);
     if (cached) return cached;
@@ -166,9 +136,7 @@ interface ClientAccess {
 
 /**
  * One provider's key, base URL and fetch: the client's route for the provider
- * when it set one, else the session's credential when it has one, else the
- * process's key. With the credential, the base URL is the session's endpoint
- * for the provider when it named one, else the process's variable.
+ * when it set one, else the process's key and base URL variable.
  */
 function clientAccess(
   env: Env,
@@ -181,17 +149,10 @@ function clientAccess(
     throw new Error(`Provider "${provider}" is disabled for this session (providers/disable)`);
   }
   if (route) {
-    return { apiKey: SESSION_CREDENTIAL_KEY, baseURL: route.baseUrl, fetch: routeFetch(route) };
+    return { apiKey: ROUTE_KEY_PLACEHOLDER, baseURL: route.baseUrl, fetch: routeFetch(route) };
   }
-  const endpoint = access?.credential
-    ? (access.endpoints?.[provider] ?? access.endpoint)
-    : undefined;
-  const baseURL = endpoint ?? env[vars.baseURL];
-  const where = baseURL ? { baseURL } : {};
-  if (access?.credential) {
-    return { apiKey: SESSION_CREDENTIAL_KEY, ...where, fetch: credentialFetch(access.credential) };
-  }
-  return { apiKey: required(env, vars.key), ...where };
+  const baseURL = env[vars.baseURL];
+  return { apiKey: required(env, vars.key), ...(baseURL ? { baseURL } : {}) };
 }
 
 function resolveModel(model: string, env: Env, access?: ModelAccess): LanguageModelV4 {

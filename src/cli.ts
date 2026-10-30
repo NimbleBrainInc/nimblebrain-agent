@@ -35,14 +35,14 @@
 import { existsSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import { createAgent, AGENT_VERSION } from "./acp/agent.ts";
-import { type ConnectionAuth, createConnectionAuth } from "./serve/connection-auth.ts";
-import { serveHttp } from "./serve/http.ts";
+import { AGENT_VERSION, createAgent } from "./acp/agent.ts";
 import type { SessionSettings } from "./acp/session-options.ts";
 import { DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS } from "./limits.ts";
 import { createModelResolver } from "./model/resolve.ts";
 import { log } from "./observability/log.ts";
 import { resolveMaxOutputTokens } from "./runtime/resolve-max-output-tokens.ts";
+import { type ConnectionAuth, createConnectionAuth } from "./serve/connection-auth.ts";
+import { serveHttp } from "./serve/http.ts";
 
 const DEFAULT_MODEL = "anthropic:claude-sonnet-4-6";
 const DEFAULT_SYSTEM_PROMPT =

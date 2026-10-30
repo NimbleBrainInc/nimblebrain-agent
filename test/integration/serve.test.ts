@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, type KeyObject, sign } from "node:crypto";
-import * as acp from "@agentclientprotocol/sdk/unstable";
 import { createHttpStream } from "@agentclientprotocol/sdk/experimental/http-client";
+import * as acp from "@agentclientprotocol/sdk/unstable";
 import type { LanguageModelV4 } from "@ai-sdk/provider";
-import { SESSION_META_KEY, type SessionSettings } from "../../src/acp/session-options.ts";
+import type { SessionSettings } from "../../src/acp/session-options.ts";
 import type { ModelAccess } from "../../src/model/resolve.ts";
 import { CONNECTION_AUDIENCE, createConnectionAuth } from "../../src/serve/connection-auth.ts";
 import { serveHttp, type Worker } from "../../src/serve/http.ts";
@@ -88,7 +88,9 @@ async function connect(url: string, token: string) {
       sessionId,
       prompt: [{ type: "text", text }],
     });
-  return { agent, open, prompt, updates, close: () => connection.close() };
+  const setProvider = (route: acp.SetProviderRequest) =>
+    agent.request(acp.methods.agent.providers.set, route);
+  return { agent, open, prompt, setProvider, updates, close: () => connection.close() };
 }
 
 const echo = () => createEchoModel({ responses: [{ text: "hello" }, { text: "again" }] });
@@ -127,18 +129,21 @@ describe("nimblebrain-agent serve", () => {
     b.close();
   });
 
-  test("a session's model calls present the credential its client handed it", async () => {
+  test("a session's model calls take the routes its client set", async () => {
     const seen: (ModelAccess | undefined)[] = [];
     const { url, token } = await start((_model, access) => {
       seen.push(access);
       return echo();
     });
     const client = await connect(url, token);
-    const { sessionId } = await client.open({
-      [SESSION_META_KEY]: { modelCredential: "turn-jwt" },
-    });
+    const route = {
+      baseUrl: "https://gateway.example/anthropic/v1",
+      headers: { Authorization: "Bearer turn-jwt" },
+    };
+    await client.setProvider({ providerId: "anthropic", apiType: "anthropic", ...route });
+    const { sessionId } = await client.open();
     await client.prompt(sessionId, "hi");
-    expect(seen.at(-1)).toEqual({ credential: "turn-jwt" });
+    expect(seen.at(-1)).toEqual({ providers: { anthropic: route } });
     client.close();
   });
 

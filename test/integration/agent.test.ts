@@ -17,8 +17,8 @@ import {
 } from "../../src/acp/session-options.ts";
 import type { ModelAccess, ModelResolver } from "../../src/model/resolve.ts";
 import { log } from "../../src/observability/log.ts";
-import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
 import { type AcpStubMcp, acpStubMcp } from "../helpers/acp-stub-mcp.ts";
+import { createEchoModel, type EchoModelResponse } from "../helpers/echo-model.ts";
 import { type StubMcp, startStubMcp } from "../helpers/stub-mcp.ts";
 
 // nimblebrain-agent as any ACP client sees it: a session, tools from the MCP servers the
@@ -107,6 +107,7 @@ async function session(
   meta?: Record<string, unknown>,
   onUpdate?: (u: acp.SessionUpdate) => void,
   overAcp?: AcpStubMcp,
+  standard: { routes?: acp.SetProviderRequest[]; systemPrompt?: acp.SystemPrompt } = {},
 ) {
   const resolveModel = typeof model === "function" ? model : () => model;
   if (!overAcp) mcp ??= startStubMcp((input) => `order ${input.orderId} shipped`);
@@ -124,7 +125,11 @@ async function session(
   const init = await agent.request(acp.methods.agent.initialize, {
     protocolVersion: acp.PROTOCOL_VERSION,
   });
+  for (const route of standard.routes ?? []) {
+    await agent.request(acp.methods.agent.providers.set, route);
+  }
   const { sessionId } = await agent.request(acp.methods.agent.session.new, {
+    ...(standard.systemPrompt ? { systemPrompt: standard.systemPrompt } : {}),
     cwd: "/",
     mcpServers: overAcp
       ? [overAcp.server]
@@ -182,15 +187,25 @@ describe("the agent over plain ACP", () => {
 describe("the agent with a host's session options", () => {
   test("takes the host's system prompt and history whole", async () => {
     const { model, prompts } = recording([{ text: "ok" }]);
-    const s = await session(model, {
-      [SESSION_META_KEY]: {
-        system: "host system prompt",
-        history: encodeMessages([
-          { role: "user", content: [{ type: "text", text: "earlier question" }] },
-          { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
-        ]),
+    const s = await session(
+      model,
+      {
+        [SESSION_META_KEY]: {
+          history: encodeMessages([
+            { role: "user", content: [{ type: "text", text: "earlier question" }] },
+            { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+          ]),
+        },
       },
-    });
+      undefined,
+      undefined,
+      {
+        systemPrompt: {
+          mode: "override",
+          content: [{ type: "text", text: "host system prompt" }],
+        },
+      },
+    );
     await s.prompt("now");
     const [system, ...rest] = prompts[0] ?? [];
     expect(system).toMatchObject({ role: "system", content: "host system prompt" });
@@ -450,55 +465,45 @@ describe("the agent with tools on the ACP connection", () => {
   });
 });
 
-describe("the agent's model endpoint option", () => {
-  test("is refused without the session's own model credential", async () => {
+describe("the session options ACP's own fields replaced", () => {
+  test("are refused, naming the field to use", async () => {
     const { model } = recording([{ text: "ok" }]);
-    await expect(
-      session(model, { [SESSION_META_KEY]: { modelEndpoint: "https://elsewhere.example/v1" } }),
-    ).rejects.toThrow(/modelEndpoint and modelEndpoints need the session's own modelCredential/);
-    await expect(
-      session(model, {
-        [SESSION_META_KEY]: { modelEndpoints: { anthropic: "https://elsewhere.example/v1" } },
-      }),
-    ).rejects.toThrow(/modelEndpoint and modelEndpoints need the session's own modelCredential/);
+    const refused = async (options: Record<string, unknown>, use: RegExp) =>
+      expect(session(model, { [SESSION_META_KEY]: options })).rejects.toThrow(use);
+    await refused({ system: "x" }, /"system" is gone: use ACP's systemPrompt/);
+    await refused({ modelCredential: "t" }, /"modelCredential" is gone: use ACP's providers\/set/);
+    await refused({ modelEndpoint: "https://x.example/v1" }, /"modelEndpoint" is gone/);
+    await refused({ modelEndpoints: {} }, /"modelEndpoints" is gone/);
   });
+});
 
-  test("hands the resolver each provider's endpoint beside the credential", async () => {
+describe("the agent's provider routes", () => {
+  test("reach the model resolver for every call of the session", async () => {
     const { model } = recording([{ text: "ok" }]);
     const accesses: (ModelAccess | undefined)[] = [];
-    const endpoints = { anthropic: "https://gateway.example/anthropic/v1" };
+    const route = {
+      providerId: "anthropic",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example/anthropic/v1",
+      headers: { Authorization: "Bearer turn-jwt" },
+    };
     const s = await session(
       (_id, access) => {
         accesses.push(access);
         return model;
       },
-      { [SESSION_META_KEY]: { modelCredential: "turn-jwt", modelEndpoints: endpoints } },
+      undefined,
+      undefined,
+      undefined,
+      { routes: [route] },
     );
     await s.prompt("hi");
     expect(accesses.length).toBeGreaterThan(0);
-    for (const access of accesses) expect(access).toEqual({ credential: "turn-jwt", endpoints });
-    s.close();
-  });
-
-  test("reaches the model resolver beside the session's credential", async () => {
-    const { model } = recording([{ text: "ok" }]);
-    const accesses: (ModelAccess | undefined)[] = [];
-    const s = await session(
-      (_id, access) => {
-        accesses.push(access);
-        return model;
-      },
-      {
-        [SESSION_META_KEY]: {
-          modelCredential: "turn-jwt",
-          modelEndpoint: "https://gateway.example/v1",
-        },
-      },
-    );
-    await s.prompt("hi");
-    expect(accesses.length).toBeGreaterThan(0);
-    for (const access of accesses)
-      expect(access).toEqual({ credential: "turn-jwt", endpoint: "https://gateway.example/v1" });
+    for (const access of accesses) {
+      expect(access).toEqual({
+        providers: { anthropic: { baseUrl: route.baseUrl, headers: route.headers } },
+      });
+    }
     s.close();
   });
 });
@@ -511,11 +516,15 @@ describe("the agent's log lines", () => {
         { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
         { text: "done" },
       ]);
-      const s = await session(model, {
-        [SESSION_META_KEY]: {
-          modelCredential: "turn-jwt-secret",
-          modelEndpoint: "https://gateway.example/v1?k=v",
-        },
+      const s = await session(model, undefined, undefined, undefined, {
+        routes: [
+          {
+            providerId: "anthropic",
+            apiType: "anthropic",
+            baseUrl: "https://gateway.example/v1?k=v",
+            headers: { Authorization: "Bearer turn-jwt-secret" },
+          },
+        ],
       });
       await s.prompt("hi");
       await s.agent.request(acp.methods.agent.session.close, { sessionId: s.sessionId });
@@ -641,8 +650,15 @@ describe("the agent's log lines", () => {
         doStream: () => Promise.reject(rejected()),
         doGenerate: () => Promise.reject(rejected()),
       };
-      const s = await session(model, {
-        [SESSION_META_KEY]: { modelCredential: "turn-jwt-secret" },
+      const s = await session(model, undefined, undefined, undefined, {
+        routes: [
+          {
+            providerId: "anthropic",
+            apiType: "anthropic",
+            baseUrl: "https://gateway.example/v1",
+            headers: { Authorization: "Bearer turn-jwt-secret" },
+          },
+        ],
       });
       await expect(s.prompt("hi")).rejects.toThrow();
       s.close();

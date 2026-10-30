@@ -34,13 +34,13 @@ together.
   or credential store, no platform tool. A host's state reaches nimblebrain-agent through ACP (its standard
   fields, such as `systemPrompt` and `providers/*`), as session options, or as MCP servers named at
   `session/new`, and nothing else.
-- **A standard ACP field beats a session option.** Where ACP has a field for something a session option
-  also carries, take the field, let it win when both arrive, and keep the option until clients have moved.
+- **A standard ACP field replaces a session option.** Where ACP has a field for something a session
+  option carries, take the field, keep the option until clients have moved, then refuse the option with
+  the field to use (`REPLACED_OPTIONS` in `src/acp/session-options.ts`).
 - **stdout is the protocol.** Every log line goes to stderr (`src/observability/log.ts` already does).
   Never write to stdout outside the ACP stream.
-- **A credential is never logged or stored.** A session's `modelCredential`, a provider route's
-  headers (`providers/set`) and the bearer on a worker's requests live in memory for as long as they
-  are used; a refusal logs its reason, never
+- **A credential is never logged or stored.** A provider route's headers (`providers/set`) and the
+  bearer on a worker's requests live in memory for as long as they are used; a refusal logs its reason, never
   the credential.
 - **Session options are a documented contract** (`README.md`, `src/acp/session-options.ts`). A
   change is a change for every client: add fields, never repurpose one.
