@@ -35,8 +35,18 @@ export const SESSION_META_KEY = "nimblebrain-agent/session";
 /** On a `session/prompt` response: the engine's own stop reason. */
 export const STOP_REASON_META_KEY = "nimblebrain-agent/stopReason";
 
-/** On a `session/prompt` response: the turn's usage, per model call and in total. */
+/**
+ * On a `session/prompt` response: the turn's usage, per model call and in total.
+ * On a turn that failed on a model call, the same key in the error's `data`
+ * holds the usage of the calls made before it.
+ */
 export const USAGE_META_KEY = "nimblebrain-agent/usage";
+
+/**
+ * In the `data` of a `session/prompt` error, when the turn failed on a model
+ * call: the call's HTTP status and the provider's reason (`ModelCallFailure`).
+ */
+export const MODEL_ERROR_KEY = "nimblebrain-agent/modelError";
 
 /** One model call of a turn: a loop iteration, or a summary written by a mid-turn fold. */
 export interface ModelCallUsage {

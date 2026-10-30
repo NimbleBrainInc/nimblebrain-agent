@@ -9,6 +9,7 @@ import type {
 import { createAgent } from "../../src/acp/agent.ts";
 import {
   encodeMessages,
+  MODEL_ERROR_KEY,
   SESSION_META_KEY,
   type SessionSettings,
   STOP_REASON_META_KEY,
@@ -299,6 +300,95 @@ describe("the agent's usage report", () => {
       cachedWriteTokens: 620,
     });
     s.close();
+  });
+});
+
+describe("a turn that fails on a model call", () => {
+  /** A model whose first call answers from `first` and whose second fails with `failure`. */
+  function failingSecondCall(failure: () => Error): LanguageModelV4 {
+    const { model } = recording(
+      [
+        {
+          toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"8812"}' }],
+        },
+      ],
+      [providerUsage({ noCache: 900, cacheRead: 0, cacheWrite: 0, output: 40 })],
+    );
+    let calls = 0;
+    return {
+      ...model,
+      doStream: (options) => (++calls === 1 ? model.doStream(options) : Promise.reject(failure())),
+    };
+  }
+
+  /** The AI SDK's error for a 429 whose body is not JSON, as a gateway's budget refusal is. */
+  const gatewayRefusal = () =>
+    Object.assign(new Error("Too Many Requests"), {
+      name: "AI_APICallError",
+      statusCode: 429,
+      responseBody: "rate limit exceeded",
+    });
+
+  test("returns the call's status, the provider's reason and the turn's usage so far", async () => {
+    const s = await session(failingSecondCall(gatewayRefusal));
+    const failed = await s.prompt("Where is order 8812?").then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    s.close();
+
+    expect(failed).toBeInstanceOf(acp.RequestError);
+    const error = failed as acp.RequestError;
+    expect(error.code).toBe(-32603);
+    expect(error.message).toBe(
+      "Internal error: model call failed with status 429: rate limit exceeded",
+    );
+    const data = error.data as Record<string, unknown>;
+    expect(data[MODEL_ERROR_KEY]).toEqual({ status: 429, reason: "rate limit exceeded" });
+    const usage = data[USAGE_META_KEY] as TurnUsage;
+    expect(usage.calls).toHaveLength(1);
+    expect(usage.total).toMatchObject({ inputTokens: 900, outputTokens: 40 });
+  });
+
+  test("never carries a credential the session holds, whatever the provider echoed", async () => {
+    const echoed = () =>
+      Object.assign(new Error("Unauthorized"), {
+        name: "AI_APICallError",
+        statusCode: 401,
+        responseBody: '{"error":"bad token turn-jwt-secret-value"}',
+      });
+    const s = await session(failingSecondCall(echoed), undefined, undefined, undefined, {
+      routes: [
+        {
+          providerId: "anthropic",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example/v1",
+          headers: { Authorization: "Bearer turn-jwt-secret-value" },
+        },
+      ],
+    });
+    const failed = (await s
+      .prompt("Where is order 8812?")
+      .catch((err: unknown) => err)) as acp.RequestError;
+    s.close();
+
+    expect(JSON.stringify(failed.toErrorResponse())).not.toContain("turn-jwt-secret-value");
+    expect((failed.data as Record<string, unknown>)[MODEL_ERROR_KEY]).toEqual({
+      status: 401,
+      reason: '{"error":"bad token [redacted]"}',
+    });
+  });
+
+  test("leaves a failure that is not a model call as it was", async () => {
+    const s = await session(failingSecondCall(() => new Error("something else broke")));
+    const failed = (await s
+      .prompt("Where is order 8812?")
+      .catch((err: unknown) => err)) as acp.RequestError;
+    s.close();
+
+    expect(failed.code).toBe(-32603);
+    expect(failed.message).toBe("Internal error");
+    expect((failed.data as Record<string, unknown> | undefined)?.[MODEL_ERROR_KEY]).toBeUndefined();
   });
 });
 
