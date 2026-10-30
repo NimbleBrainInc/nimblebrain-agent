@@ -86,7 +86,7 @@ docker run -p 8080:8080 -v ./keys:/keys:ro -e NB_AGENT_AUTH_JWKS_FILE=/keys/run-
 - **Streaming:** message text as `agent_message_chunk`, reasoning as `agent_thought_chunk`, and each
   tool call as `tool_call` / `tool_call_update`.
 - **Cancellation:** `session/cancel` stops the turn, including a tool call in flight; the turn
-  answers `cancelled`.
+  answers `cancelled`, with the usage of the model calls that finished before the cancel.
 - **Multi-turn:** a session keeps its own history across prompts.
 
 ## Standard ACP fields
@@ -137,7 +137,8 @@ A `session/prompt` response carries in `_meta`:
 - `"nimblebrain-agent/usage"`: every model call of the turn in the order it finished, each as
   `{ model, purpose: "turn" | "summary", usage }`, and their `total`. `usage` is a
   `TokenUsage` (`src/usage/types.ts`), which keeps what ACP's `usage` drops: the 1-hour share of cache writes, and the
-  per-call split that tiered prices are computed from.
+  per-call split that tiered prices are computed from. A cancelled turn reports the calls that
+  finished before the cancel; a call the cancel cut off reported no usage and is not listed.
 
 A turn that fails on a model call (an error with an HTTP status) answers `session/prompt` with a
 JSON-RPC internal error (`-32603`), message `Internal error: model call failed with status <status>:

@@ -37,6 +37,7 @@ export const STOP_REASON_META_KEY = "nimblebrain-agent/stopReason";
 
 /**
  * On a `session/prompt` response: the turn's usage, per model call and in total.
+ * A cancelled turn's response holds the calls that finished before the cancel.
  * On a turn that failed on a model call, the same key in the error's `data`
  * holds the usage of the calls made before it.
  */

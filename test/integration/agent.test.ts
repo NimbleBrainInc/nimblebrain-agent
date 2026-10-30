@@ -496,6 +496,32 @@ describe("the agent's cancellation", () => {
     expect(response.stopReason).toBe("cancelled");
     s.close();
   });
+
+  test("a cancelled turn reports the usage of the calls that finished before the cancel", async () => {
+    mcp = startStubMcp(() => "late");
+    const { model } = recording(
+      [
+        { toolCalls: [{ toolCallId: "t1", toolName: "lookup_order", input: '{"orderId":"1"}' }] },
+        { text: "never" },
+      ],
+      [providerUsage({ noCache: 900, cacheRead: 0, cacheWrite: 0, output: 40 })],
+    );
+    let cancel: (() => void) | undefined;
+    const s = await session(model, undefined, (u) => {
+      if (u.sessionUpdate === "tool_call") cancel?.();
+    });
+    cancel = () =>
+      void s.agent.notify(acp.methods.agent.session.cancel, { sessionId: s.sessionId });
+    const response = await s.prompt("go");
+    s.close();
+
+    expect(response.stopReason).toBe("cancelled");
+    expect(response._meta?.[STOP_REASON_META_KEY]).toBe("cancelled");
+    const usage = response._meta?.[USAGE_META_KEY] as TurnUsage;
+    expect(usage.calls).toHaveLength(1);
+    expect(usage.total).toMatchObject({ inputTokens: 900, outputTokens: 40 });
+    expect(response.usage).toMatchObject({ inputTokens: 900, outputTokens: 40 });
+  });
 });
 
 describe("the agent with tools on the ACP connection", () => {
