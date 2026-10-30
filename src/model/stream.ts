@@ -227,6 +227,11 @@ async function callModelInner(
         retryable: !sawOutput,
       });
     }
+    // Any other failure after output reached the client is not retryable either,
+    // by the same rule: a stream cut mid-read arrives as an `APICallError` the
+    // SDK marks retryable (a network code in its cause), and re-issuing the
+    // call would stream the deltas again.
+    if (watchdog.sawOutput) throw markNotRetryable(err);
     throw err;
   } finally {
     unregisterLiveness(watchdog.signal);
@@ -247,6 +252,18 @@ async function callModelInner(
     // recovery (failed attempts + backoff).
     ttftMs: watchdog.ttftMs,
   };
+}
+
+/**
+ * Mark a failure `retryable: false` for `withRetry`, which reads that marker
+ * ahead of the provider's verdict. The error is kept, not wrapped: its status,
+ * body and message are what the turn's error reports.
+ */
+function markNotRetryable(err: unknown): unknown {
+  if (err !== null && typeof err === "object" && Object.isExtensible(err)) {
+    Object.defineProperty(err, "retryable", { value: false, configurable: true, writable: true });
+  }
+  return err;
 }
 
 /**
