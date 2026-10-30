@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import type { LanguageModelV4Prompt } from "@ai-sdk/provider";
 import { createAgent } from "../../src/acp/agent.ts";
-import { SESSION_META_KEY, type SessionSettings } from "../../src/acp/session-options.ts";
+import type { SessionSettings } from "../../src/acp/session-options.ts";
 import type { ModelAccess } from "../../src/model/resolve.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 
@@ -80,16 +80,6 @@ describe("systemPrompt", () => {
       role: "system",
       content: "default system prompt\n\none\n\ntwo",
     });
-    c.close();
-  });
-
-  test("wins over the session option's system prompt", async () => {
-    const c = await connect();
-    await c.turn({
-      systemPrompt: { mode: "override", content: [text("standard")] },
-      _meta: { [SESSION_META_KEY]: { system: "option" } },
-    });
-    expect(c.prompts[0]?.[0]).toMatchObject({ role: "system", content: "standard" });
     c.close();
   });
 

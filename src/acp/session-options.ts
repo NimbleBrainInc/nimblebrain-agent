@@ -3,24 +3,19 @@
  * thing nimblebrain-agent sends back.
  *
  * ACP v1 has no slot for history the agent did not produce itself or for a
- * turn's limits. (Its `systemPrompt` and `providers/*` fields, which the agent
- * also takes, cover a system prompt and model access, and win over `system` and
- * the model credential options here when a client sends both.) A client that holds those (a
- * host that owns the conversation, as NimbleBrain does) sends them on
- * `session/new` under {@link SESSION_META_KEY}. Every field is optional: what a
- * client leaves out comes from nimblebrain-agent's own defaults (`nimblebrain-agent acp` reads them
- * from its environment), so a plain ACP client needs none of this.
+ * turn's limits. A client that holds those (a host that owns the conversation,
+ * as NimbleBrain does) sends them on `session/new` under {@link SESSION_META_KEY}.
+ * A system prompt and model access go by ACP's own fields instead (`systemPrompt`
+ * on `session/new`, `providers/*`). Every field is optional: what a client leaves
+ * out comes from nimblebrain-agent's own defaults (`nimblebrain-agent acp` reads
+ * them from its environment), so a plain ACP client needs none of this.
  *
  *   _meta: { "nimblebrain-agent/session": {
- *     system?: string,           // the system prompt
  *     history?: string,          // prior messages, oldest first, encodeMessages()
  *     model?: string,            // "provider:model"
  *     maxIterations?: number, maxInputTokens?: number, maxOutputTokens?: number,
  *     thinking?: ResolvedThinking,
  *     compaction?: false | { model?: string },  // mid-turn fold: off, or its summarizer model
- *     modelCredential?: string,  // bearer the session's model calls present instead of the worker's key
- *     modelEndpoint?: string,    // base URL for those calls (a model gateway); only with modelCredential
- *     modelEndpoints?: Record<string, string>,  // a base URL per provider, ahead of modelEndpoint; only with modelCredential
  *   } }
  *
  * A `session/prompt` response carries nimblebrain-agent's own stop reason under
@@ -76,27 +71,21 @@ export interface SessionSettings {
 }
 
 /** The options a client may send. Every field is optional. */
-export type SessionOptions = Partial<SessionSettings> & {
+export type SessionOptions = Partial<Omit<SessionSettings, "system">> & {
   /** Prior history, oldest first, encoded with {@link encodeMessages}. */
   history?: string;
-  /**
-   * A bearer credential the session's model calls present in place of the
-   * worker's provider key: a model gateway's per-turn credential. Held in
-   * memory for the session's life and never logged.
-   */
-  modelCredential?: string;
-  /**
-   * The base URL the session's model calls go to: a model gateway. Taken only
-   * with {@link modelCredential}; a session without its own credential uses the
-   * worker's endpoint and key, so a client never redirects the worker's key.
-   */
-  modelEndpoint?: string;
-  /**
-   * A base URL per provider (`anthropic`, `google`, ...), for a gateway that
-   * serves each provider at its own address. A call goes to its provider's entry,
-   * else to {@link modelEndpoint}. Refused without {@link modelCredential}.
-   */
-  modelEndpoints?: Record<string, string>;
+};
+
+/**
+ * Options ACP's own fields replaced, each with the field to use. A session that
+ * sends one is refused, so a client that has not moved finds out at once
+ * instead of running on the wrong prompt or the wrong key.
+ */
+export const REPLACED_OPTIONS: Record<string, string> = {
+  system: "ACP's systemPrompt on session/new",
+  modelCredential: "ACP's providers/set, with the credential in its headers",
+  modelEndpoint: "ACP's providers/set",
+  modelEndpoints: "ACP's providers/set",
 };
 
 const BYTES_TAG = "__nb_agent_bytes";

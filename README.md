@@ -94,16 +94,15 @@ docker run -p 8080:8080 -v ./keys:/keys:ro -e NB_AGENT_AUTH_JWKS_FILE=/keys/run-
 nimblebrain-agent takes these ACP fields (both unstable in the spec) and advertises them at `initialize`:
 
 - **`systemPrompt` on `session/new`** (`sessionCapabilities.systemPrompt`, append and override).
-  `override` replaces nimblebrain-agent's own prompt; `append` adds to it. Text content only. It wins over
-  the `system` session option.
+  `override` replaces nimblebrain-agent's own prompt; `append` adds to it. Text content only.
 - **`providers/list`, `providers/set`, `providers/disable`** (`agentCapabilities.providers`). Every
   provider is listed with its protocol (`anthropic`, `openai`, or `gemini` for Google; xAI, Nebius and
   GreenPT speak `openai`) and where its calls go now. `providers/set` sends that provider's calls to
   `baseUrl` with exactly `headers`, and never with the worker's own key; empty headers send no
   authorization. `providers/disable` makes the provider refuse calls. The configuration belongs to the
   connection (`serve` gives each connection an agent of its own) and reaches the sessions opened after it.
-  A route a client set wins over `modelCredential` / `modelEndpoints` for that provider. Headers are never
-  listed or logged.
+  A host whose gateway issues a credential per turn sets each provider to the gateway with the credential
+  in `headers`. Headers are held in memory and never listed or logged.
 
 ## Session options
 
@@ -113,28 +112,19 @@ is optional; what is left out comes from the defaults above.
 ```jsonc
 "_meta": {
   "nimblebrain-agent/session": {
-    "system": "…",              // the system prompt
     "history": "…",             // prior messages, oldest first (below)
     "model": "anthropic:claude-sonnet-4-6",
     "maxIterations": 25,
     "maxInputTokens": 200000,
     "maxOutputTokens": 8192,
     "thinking": { "mode": "effort", "effort": "medium", "source": "config" },
-    "compaction": { "model": "anthropic:claude-haiku-4-5" },  // or false: never fold
-    "modelCredential": "…",     // a bearer the session's model calls present instead of the key
-    "modelEndpoint": "https://…",  // where those calls go (a model gateway); only with modelCredential
-    "modelEndpoints": { "google": "https://…/google/v1beta" }  // per provider, ahead of modelEndpoint
+    "compaction": { "model": "anthropic:claude-haiku-4-5" }  // or false: never fold
   }
 }
 ```
 
-`modelCredential` is for a host whose model gateway issues a credential per turn: the session's
-calls send it as `Authorization: Bearer`, whichever provider they are for, in place of the worker's
-provider key, and no provider key header goes with them. It is held in memory for the session's life
-and never logged. `modelEndpoint` sends those calls to that base URL instead of the worker's;
-`modelEndpoints` names a base URL per provider, for a gateway that serves each provider at its own
-address, and a call goes to its provider's entry ahead of `modelEndpoint`. Both are refused without
-`modelCredential`, so a client can never send the worker's own key to an address it chose.
+The system prompt and model access go by ACP's own fields (above). A session that still sends
+`system`, `modelCredential`, `modelEndpoint` or `modelEndpoints` is refused with the field to use.
 
 `history` is a JSON array of [AI SDK](https://ai-sdk.dev) `LanguageModelV4Message`s, with a file
 part's bytes written as `{ "__nb_agent_bytes": "<base64>" }`. The turn's own message is the
