@@ -111,6 +111,20 @@ describe("callModel + google — an error envelope sent inside the stream", () =
     expect(err.isRetryable).toBe(true);
   });
 
+  it("test_non_retryable_error_is_reported_with_its_status_after_one_attempt", async () => {
+    const denied = {
+      error: { code: 403, message: "Permission denied.", status: "PERMISSION_DENIED" },
+    };
+    const { fetch, calls } = sseResponses([denied]);
+    const model = resolvedGoogleModel(fetch);
+
+    const err = await rejection(withRetry(() => callModel(model, prompt, () => {}), 3, 0));
+
+    expect(calls()).toBe(1);
+    expect(err.statusCode).toBe(403);
+    expect(err.isRetryable).toBe(false);
+  });
+
   it("test_unparseable_chunk_fails_the_call_without_a_status", async () => {
     const model = resolvedGoogleModel(
       sseResponses([textChunk("Hello"), { candidates: "nope" }]).fetch,
@@ -135,6 +149,18 @@ describe("callModel + google — an error envelope sent inside the stream", () =
     expect(types).not.toContain("error");
     expect(types).toContain("text-delta");
     expect(types.at(-1)).toBe("finish");
+  });
+
+  it("test_requested_raw_chunks_are_passed_on", async () => {
+    const model = resolvedGoogleModel(sseResponses([textChunk("Hello"), stopChunk]).fetch);
+
+    const { stream } = await model.doStream({ ...prompt, includeRawChunks: true });
+    const raw: unknown[] = [];
+    for await (const part of stream as unknown as AsyncIterable<LanguageModelV4StreamPart>) {
+      if (part.type === "raw") raw.push(part.rawValue);
+    }
+
+    expect(raw).toEqual([textChunk("Hello"), stopChunk]);
   });
 });
 
