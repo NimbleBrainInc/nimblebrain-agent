@@ -15,6 +15,7 @@ import type { LanguageModelV4 } from "@ai-sdk/provider";
 import { createXai } from "@ai-sdk/xai";
 import { defaultSettingsMiddleware, wrapLanguageModel } from "ai";
 import { wrapFetchWithLiveness } from "./fetch-liveness.ts";
+import { googleStreamErrorMiddleware } from "./google-stream-error.ts";
 
 /**
  * Where one provider's calls go and the headers they carry, as a client set it
@@ -181,10 +182,14 @@ function resolveModel(model: string, env: Env, access?: ModelAccess): LanguageMo
     }
     case "openai":
       return createOpenAI(client("OPENAI_API_KEY", "OPENAI_BASE_URL")).languageModel(modelId);
+    // An error Gemini sends inside the stream fails the call (google-stream-error.ts).
     case "google":
-      return createGoogleGenerativeAI(
-        client("GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_BASE_URL"),
-      ).languageModel(modelId);
+      return wrapLanguageModel({
+        model: createGoogleGenerativeAI(
+          client("GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_BASE_URL"),
+        ).languageModel(modelId),
+        middleware: googleStreamErrorMiddleware,
+      });
     // Chat Completions, named rather than the adapter's default, which has moved
     // between adapter majors.
     case "xai":
