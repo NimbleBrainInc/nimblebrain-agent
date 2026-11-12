@@ -1,6 +1,7 @@
 {
   "name": "nimblebrain-agent",
   "version": "0.5.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "nimblebrain-agent: an agent runtime that speaks the Agent Client Protocol",
