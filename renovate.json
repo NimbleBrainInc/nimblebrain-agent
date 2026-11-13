@@ -1,0 +1,81 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>NimbleBrainInc/renovate-config"
+  ],
+  "description": "Managers: npm (package.json and bun.lock), the digest-pinned bun image in the Dockerfile, GitHub Actions, and the `# renovate:` comments in the workflows. bunfig.toml enforces the 14-day wait on installs, so lock-file refreshes are on.",
+  "enabledManagers": [
+    "npm",
+    "dockerfile",
+    "github-actions",
+    "custom.regex"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Version pins Renovate's own managers can't see: the bun version the workflows set up (BUN_VERSION). Each carries a `# renovate:` comment naming its source.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s*\\n\\s*[A-Za-z_-]+: \"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^v?(?<version>.+)${{/if}}"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One PR for the non-major long tail; the groups below take their own packages out of it.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "dependencies"
+    },
+    {
+      "description": "bun is pinned as the Dockerfile image and as CI's BUN_VERSION, and test/unit/build-pins.test.ts requires them equal, so they move in one PR.",
+      "matchPackageNames": [
+        "oven/bun",
+        "oven-sh/bun"
+      ],
+      "groupName": "bun"
+    },
+    {
+      "description": "The AI SDK core and its providers release in lockstep against a shared model spec.",
+      "matchPackageNames": [
+        "ai",
+        "@ai-sdk/**"
+      ],
+      "groupName": "ai sdk"
+    },
+    {
+      "matchPackageNames": [
+        "@modelcontextprotocol/**"
+      ],
+      "groupName": "mcp sdk"
+    },
+    {
+      "matchPackageNames": [
+        "@opentelemetry/**"
+      ],
+      "groupName": "opentelemetry"
+    },
+    {
+      "description": "No wait for the packages bunfig.toml exempts (minimumReleaseAgeExcludes), so a dependency reaches this repo on the same terms whether a bot or a person adds it.",
+      "matchPackageNames": [
+        "@types/bun",
+        "@agentclientprotocol/sdk",
+        "@modelcontextprotocol/client",
+        "@modelcontextprotocol/core",
+        "@modelcontextprotocol/server"
+      ],
+      "minimumReleaseAge": null
+    }
+  ]
+}
